@@ -372,7 +372,7 @@
 
     <script type="module">
         import {
-            BASE_MIDI, SCALES,
+            SCALES,
             midiToFreq, midiToName,
             createNoteResolver,
         } from './src/scale.ts';
@@ -679,16 +679,18 @@
         }
 
         // =====================================================================
-        // AUDIO ENGINE — one shared master chain (gain -> compressor -> analyser
-        // -> destination) with reverb/delay sends and a generated impulse
-        // response, so no external audio assets are needed. Instruments are
-        // built as small per-note voice graphs that plug into engine.dry /
-        // engine.reverbSend / engine.delaySend.
+        // AUDIO ENGINE — every voice feeds one shared pre-FX bus (voiceBus),
+        // which fans out to four sends (clean/reverb/delay/distortion); the
+        // sends mix back together into a compressor -> analyser -> master
+        // gain -> destination. Switching world crossfades the send levels
+        // (applyWorldFX) instead of each voice choosing its own FX mix.
         // =====================================================================
         const AudioEngine = {
-            ctx: null, masterGain: null, compressor: null, limiter: null, analyser: null,
-            dry: null, reverb: null, reverbSend: null,
+            ctx: null, masterGain: null, compressor: null, analyser: null,
+            voiceBus: null, cleanSend: null,
+            reverb: null, reverbSend: null,
             delay: null, delayFeedback: null, delaySend: null,
+            distortion: null, distSend: null,
             started: false, freqData: null,
 
             init() {
@@ -697,52 +699,55 @@
                 const Ctx = window.AudioContext || window.webkitAudioContext;
                 this.ctx = new Ctx();
 
-                this.masterGain = this.ctx.createGain();
-                this.masterGain.gain.value = 0.7;
                 this.compressor = this.ctx.createDynamicsCompressor();
-                this.compressor.threshold.value = -20;
+                this.compressor.threshold.value = -15;
                 this.compressor.ratio.value = 4;
-                // Safety limiter: a second, harder compressor stage so that
-                // several voices ringing at once (pointer sweeping across
-                // scale zones) gets tamed instead of turning into clipped,
-                // buzzy overlap — see item 11 in the audio-quality pass.
-                this.limiter = this.ctx.createDynamicsCompressor();
-                this.limiter.threshold.value = -6;
-                this.limiter.knee.value = 0;
-                this.limiter.ratio.value = 20;
-                this.limiter.attack.value = 0.001;
-                this.limiter.release.value = 0.1;
                 this.analyser = this.ctx.createAnalyser();
                 this.analyser.fftSize = 512;
                 this.analyser.smoothingTimeConstant = 0.75;
                 this.freqData = new Uint8Array(this.analyser.frequencyBinCount);
+                this.masterGain = this.ctx.createGain();
+                this.masterGain.gain.value = 0.6;
 
-                this.masterGain.connect(this.compressor);
-                this.compressor.connect(this.limiter);
-                this.limiter.connect(this.analyser);
-                this.analyser.connect(this.ctx.destination);
+                this.compressor.connect(this.analyser);
+                this.analyser.connect(this.masterGain);
+                this.masterGain.connect(this.ctx.destination);
 
-                this.dry = this.ctx.createGain();
-                this.dry.gain.value = 1;
-                this.dry.connect(this.masterGain);
+                this.voiceBus = this.ctx.createGain();
+                this.voiceBus.gain.value = 1;
+
+                this.cleanSend = this.ctx.createGain();
+                this.cleanSend.gain.value = 1;
+                this.voiceBus.connect(this.cleanSend);
+                this.cleanSend.connect(this.compressor);
 
                 this.reverb = this.ctx.createConvolver();
-                this.reverb.buffer = this._impulse(2.6, 2.4);
+                this.reverb.buffer = this._impulse(3.0, 2.0);
                 this.reverbSend = this.ctx.createGain();
-                this.reverbSend.gain.value = 0.22;
+                this.reverbSend.gain.value = 0;
+                this.voiceBus.connect(this.reverbSend);
                 this.reverbSend.connect(this.reverb);
-                this.reverb.connect(this.masterGain);
+                this.reverb.connect(this.compressor);
 
                 this.delay = this.ctx.createDelay(1.0);
                 this.delay.delayTime.value = 0.3;
                 this.delayFeedback = this.ctx.createGain();
-                this.delayFeedback.gain.value = 0.22;
+                this.delayFeedback.gain.value = 0.3;
                 this.delaySend = this.ctx.createGain();
-                this.delaySend.gain.value = 0.0;
+                this.delaySend.gain.value = 0;
+                this.voiceBus.connect(this.delaySend);
                 this.delaySend.connect(this.delay);
                 this.delay.connect(this.delayFeedback);
                 this.delayFeedback.connect(this.delay);
-                this.delay.connect(this.masterGain);
+                this.delay.connect(this.compressor);
+
+                this.distortion = this.ctx.createWaveShaper();
+                this.distortion.curve = makeSaturationCurve(4); // k = amount*100 ~= 400
+                this.distSend = this.ctx.createGain();
+                this.distSend.gain.value = 0;
+                this.voiceBus.connect(this.distSend);
+                this.distSend.connect(this.distortion);
+                this.distortion.connect(this.compressor);
             },
 
             resume() {
@@ -758,6 +763,18 @@
                     for (let i = 0; i < length; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, decay);
                 }
                 return buf;
+            },
+
+            // Crossfade the four bus sends to the active world's balance —
+            // called on world switch and once audio first starts.
+            applyWorldFX(world) {
+                if (!this.started) return;
+                const now = this.ctx.currentTime;
+                const e = world.effects;
+                this.cleanSend.gain.setTargetAtTime(1.0 - e.distortion * 0.7, now, 0.5);
+                this.reverbSend.gain.setTargetAtTime(e.reverb, now, 0.5);
+                this.delaySend.gain.setTargetAtTime(e.delay, now, 0.5);
+                this.distSend.gain.setTargetAtTime(e.distortion, now, 0.5);
             },
 
             setReverbAmount(amt) {
@@ -779,7 +796,10 @@
         };
 
         function ensureAudioStarted() {
-            if (!AudioEngine.started) AudioEngine.init();
+            if (!AudioEngine.started) {
+                AudioEngine.init();
+                AudioEngine.applyWorldFX(currentWorld());
+            }
             AudioEngine.resume();
         }
 
@@ -787,12 +807,10 @@
         // it's unit-testable without an AudioContext: pointer X always lands
         // on a discrete zone in the *current world's* scale, never a glide
         // between two notes. ----
-        function brightnessFromY(y01) { return 1 - THREE.MathUtils.clamp(y01, 0, 1); }
 
-        // ---- Shared low-level DSP primitives only — noise, a saturation
-        // curve, a Karplus-Strong delay loop, and bus routing. Each of the
-        // five instrument voices below combines these into its own signal
-        // graph; none of them is "one generic voice with different knobs." ----
+        // ---- Shared low-level DSP primitives: noise (scratch gesture) and a
+        // saturation/distortion curve generator (the global distortion bus
+        // and the scratch burst both reuse this). ----
         function makeNoiseBuffer(ctx, duration) {
             const len = Math.max(1, Math.floor(ctx.sampleRate * duration));
             const buf = ctx.createBuffer(1, len, ctx.sampleRate);
@@ -800,13 +818,6 @@
             for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
             return buf;
         }
-        let _breathNoiseBuffer = null;
-        function getBreathNoiseBuffer(ctx) {
-            if (!_breathNoiseBuffer) _breathNoiseBuffer = makeNoiseBuffer(ctx, 2.0);
-            return _breathNoiseBuffer;
-        }
-        // Very mild local saturation only (Harmonica's reed rasp) — never a
-        // heavy global distortion bus.
         function makeSaturationCurve(amount) {
             const k = amount * 100;
             const n = 2048;
@@ -818,468 +829,107 @@
             return curve;
         }
 
-        // The physical-modelling core shared by Guzheng and Koto: a tuned
-        // delay-line feedback loop. Everything that actually defines each
-        // instrument's character — excitation shape, body resonances,
-        // envelope, reverb send — lives in that instrument's own function,
-        // not here.
-        function createKarplusStrongLoop(ctx, freq, { feedback, dampingHz, highpassHz }) {
-            const delay = ctx.createDelay(0.05);
-            delay.delayTime.value = 1 / freq;
-            const damping = ctx.createBiquadFilter();
-            damping.type = 'lowpass';
-            damping.frequency.value = dampingHz;
-            const feedbackGain = ctx.createGain();
-            feedbackGain.gain.value = feedback;
-            const loopHighpass = ctx.createBiquadFilter();
-            loopHighpass.type = 'highpass';
-            loopHighpass.frequency.value = highpassHz || 60;
-            delay.connect(loopHighpass);
-            loopHighpass.connect(damping);
-            damping.connect(feedbackGain);
-            feedbackGain.connect(delay);
-            return {
-                input: delay,
-                output: damping,
-                disconnect() {
-                    try { delay.disconnect(); loopHighpass.disconnect(); damping.disconnect(); feedbackGain.disconnect(); } catch (e) {}
-                },
-            };
-        }
-
-        // Routes a voice's own output gain to the shared dry/reverb buses at
-        // an amount that voice picks for itself — a controlled per-instrument
-        // send, not every voice dumped into the same wet mix.
-        function sendToBus(ctx, node, { dry = 1, reverb = 0 }) {
-            const dryGain = ctx.createGain();
-            dryGain.gain.value = dry;
-            node.connect(dryGain);
-            dryGain.connect(AudioEngine.dry);
-            let reverbGain = null;
-            if (reverb > 0) {
-                reverbGain = ctx.createGain();
-                reverbGain.gain.value = reverb;
-                node.connect(reverbGain);
-                reverbGain.connect(AudioEngine.reverbSend);
-            }
-            return { disconnect() { try { dryGain.disconnect(); if (reverbGain) reverbGain.disconnect(); } catch (e) {} } };
-        }
-
-        // A bounded pool of overlapping pluck release-tails: a new pluck
-        // never kills the previous string, it's left to ring out naturally.
-        // Only once more than `max` are ringing at once does the oldest get
-        // faded fast, so a fast sweep can't pile voices into a wall of noise.
-        function createPluckVoicePool(max) {
-            let voices = [];
-            return {
-                add(voice) {
-                    while (voices.length >= max) voices.shift().choke();
-                    voices.push(voice);
-                },
-                remove(voice) { voices = voices.filter((v) => v !== voice); },
-            };
-        }
-
         // =====================================================================
-        // GUZHENG — procedural Karplus-Strong pluck: a rounded, lowpass-
-        // shaped noise burst excites the string, two-to-three restrained
-        // wooden body resonances colour it, and it's allowed a long, warm
-        // decay. Higher notes ring a little shorter and brighter, lower
-        // notes a little warmer and longer.
+        // INSTRUMENT VOICE — the one voice graph every world plays through:
+        // two oscillators -> lowpass filter -> gain envelope -> the shared FX
+        // buses. The five worlds differ only through world.synth/world.effects
+        // (oscillator waveforms, ADSR, filter, detune) — not through separate
+        // per-instrument code.
         // =====================================================================
-        const guzhengVoices = createPluckVoicePool(8);
-        function triggerGuzhengPluck(midi, y01, energy) {
+        const SECOND_OSC_TYPE = { celtic: 'sine', egyptian: 'triangle' };
+
+        function createInstrumentVoice(freq, velocity, yRatio, world) {
             const ctx = AudioEngine.ctx;
             const now = ctx.currentTime;
-            const freq = midiToFreq(midi);
-            const brightness = brightnessFromY(y01);
-            const register = THREE.MathUtils.clamp((midi - BASE_MIDI) / 36, 0, 1);
+            const s = world.synth;
+            const nyquist = ctx.sampleRate / 2;
 
-            const burst = ctx.createBufferSource();
-            burst.buffer = makeNoiseBuffer(ctx, 0.014 - register * 0.004);
-            const exciteShape = ctx.createBiquadFilter();
-            exciteShape.type = 'lowpass';
-            exciteShape.frequency.value = 3200 + brightness * 1400;
-            exciteShape.Q.value = 0.3;
+            const osc1 = ctx.createOscillator();
+            osc1.type = s.type;
+            osc1.frequency.value = freq;
 
-            const string = createKarplusStrongLoop(ctx, freq, {
-                feedback: 0.988 - register * 0.01,
-                dampingHz: 2600 + brightness * 1400 - register * 300,
-                highpassHz: 55,
-            });
+            const osc2 = ctx.createOscillator();
+            osc2.type = SECOND_OSC_TYPE[world.key] || s.type;
+            osc2.frequency.value = freq;
+            osc2.detune.value = s.detune;
 
-            const body1 = ctx.createBiquadFilter();
-            body1.type = 'peaking'; body1.frequency.value = 210; body1.Q.value = 1.0; body1.gain.value = 3.5;
-            const body2 = ctx.createBiquadFilter();
-            body2.type = 'peaking'; body2.frequency.value = 520; body2.Q.value = 0.9; body2.gain.value = 2.5;
-            const body3 = ctx.createBiquadFilter();
-            body3.type = 'peaking'; body3.frequency.value = 1150; body3.Q.value = 0.8; body3.gain.value = 1.8;
-
-            const outGain = ctx.createGain();
-            outGain.gain.setValueAtTime(0.0001, now);
-            outGain.gain.linearRampToValueAtTime(0.4 + energy * 0.2, now + 0.006);
-            const decay = (2.6 - register * 0.8) * (0.6 + energy * 0.7);
-            outGain.gain.setTargetAtTime(0.0001, now + 0.03, decay / 4);
-
-            burst.connect(exciteShape);
-            exciteShape.connect(string.input);
-            string.output.connect(body1); body1.connect(body2); body2.connect(body3); body3.connect(outGain);
-            const bus = sendToBus(ctx, outGain, { dry: 1, reverb: 0.3 });
-
-            burst.start(now);
-            burst.stop(now + 0.02);
-
-            // A tiny post-pluck bend — only on a deliberately energetic
-            // gesture, at most a few tens of cents, never every note.
-            if (energy > 0.55 && Math.random() < 0.12) {
-                const cents = 20 + Math.random() * 25;
-                string.input.delayTime.setValueAtTime(1 / freq, now + 0.05);
-                string.input.delayTime.linearRampToValueAtTime(1 / (freq * Math.pow(2, cents / 1200)), now + 0.22);
+            // Blues-only reference-style attack ornament: starts flat and
+            // glides up onto the exact target within ~0.15s. This decorates
+            // the attack of an already-resolved discrete note — it never
+            // slides between two different notes.
+            if (world.key === 'blues') {
+                const bendCents = -100 * velocity;
+                osc1.detune.setValueAtTime(bendCents, now);
+                osc1.detune.linearRampToValueAtTime(0, now + 0.15);
+                osc2.detune.setValueAtTime(s.detune + bendCents, now);
+                osc2.detune.linearRampToValueAtTime(s.detune, now + 0.15);
             }
 
-            const voice = {
-                choke() {
-                    try { outGain.gain.cancelScheduledValues(ctx.currentTime); outGain.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.008); } catch (e) {}
-                    setTimeout(cleanup, 60);
-                },
-            };
-            function cleanup() {
-                try { string.disconnect(); body1.disconnect(); body2.disconnect(); body3.disconnect(); outGain.disconnect(); exciteShape.disconnect(); bus.disconnect(); } catch (e) {}
-                guzhengVoices.remove(voice);
-            }
-            guzhengVoices.add(voice);
-            setTimeout(cleanup, decay * 1000 + 400);
-        }
+            const mixGain = ctx.createGain();
+            osc1.connect(mixGain);
+            osc2.connect(mixGain);
 
-        // =====================================================================
-        // KOTO — a structurally different pluck: a harder, shorter noise
-        // burst, faster damping, one sharp bridge/nasal resonance in place
-        // of Guzheng's warm body stack, a much shorter decay and far less
-        // reverb. Shares only the low-level Karplus-Strong loop utility.
-        // =====================================================================
-        const kotoVoices = createPluckVoicePool(8);
-        function triggerKotoPluck(midi, y01, energy) {
-            const ctx = AudioEngine.ctx;
-            const now = ctx.currentTime;
-            const freq = midiToFreq(midi);
-            const brightness = brightnessFromY(y01);
-            const register = THREE.MathUtils.clamp((midi - BASE_MIDI) / 36, 0, 1);
-
-            const burst = ctx.createBufferSource();
-            burst.buffer = makeNoiseBuffer(ctx, 0.005);
-            const exciteShape = ctx.createBiquadFilter();
-            exciteShape.type = 'highpass';
-            exciteShape.frequency.value = 700;
-
-            const string = createKarplusStrongLoop(ctx, freq, {
-                feedback: 0.965 - register * 0.01,
-                dampingHz: 5200 + brightness * 1200,
-                highpassHz: 140,
-            });
-
-            const bridge = ctx.createBiquadFilter();
-            bridge.type = 'peaking'; bridge.frequency.value = 1500 + brightness * 400; bridge.Q.value = 2.2; bridge.gain.value = 4;
-
-            const outGain = ctx.createGain();
-            outGain.gain.setValueAtTime(0.0001, now);
-            outGain.gain.linearRampToValueAtTime(0.42 + energy * 0.18, now + 0.002);
-            const decay = Math.max(0.25, 0.55 - register * 0.15) * (0.6 + energy * 0.6);
-            outGain.gain.setTargetAtTime(0.0001, now + 0.015, decay / 4);
-
-            burst.connect(exciteShape);
-            exciteShape.connect(string.input);
-            string.output.connect(bridge); bridge.connect(outGain);
-            const bus = sendToBus(ctx, outGain, { dry: 1, reverb: 0.09 });
-
-            burst.start(now);
-            burst.stop(now + 0.01);
-
-            if (energy > 0.6 && Math.random() < 0.05) {
-                const cents = 10 + Math.random() * 15;
-                string.input.delayTime.setValueAtTime(1 / freq, now + 0.03);
-                string.input.delayTime.linearRampToValueAtTime(1 / (freq * Math.pow(2, cents / 1200)), now + 0.12);
-            }
-
-            const voice = {
-                choke() {
-                    try { outGain.gain.cancelScheduledValues(ctx.currentTime); outGain.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.006); } catch (e) {}
-                    setTimeout(cleanup, 50);
-                },
-            };
-            function cleanup() {
-                try { string.disconnect(); bridge.disconnect(); outGain.disconnect(); exciteShape.disconnect(); bus.disconnect(); } catch (e) {}
-                kotoVoices.remove(voice);
-            }
-            kotoVoices.add(voice);
-            setTimeout(cleanup, decay * 1000 + 300);
-        }
-
-        // =====================================================================
-        // TIN WHISTLE — additive pipe tone: a dominant sine fundamental plus
-        // two quiet upper harmonics, a small amount of filtered breath noise,
-        // and a slow, shallow vibrato. Clean, narrow, clearly pitched — not a
-        // filtered triangle oscillator.
-        // =====================================================================
-        function createTinWhistleVoice(midi, y01, energy) {
-            const ctx = AudioEngine.ctx;
-            const now = ctx.currentTime;
-            const freq = midiToFreq(midi);
-            const breath01 = THREE.MathUtils.clamp(y01, 0, 1);
-
-            const mix = ctx.createGain();
-            const fundamental = ctx.createOscillator();
-            fundamental.type = 'sine'; fundamental.frequency.value = freq;
-            const fundamentalGain = ctx.createGain(); fundamentalGain.gain.value = 1.0;
-            fundamental.connect(fundamentalGain); fundamentalGain.connect(mix);
-
-            const h2 = ctx.createOscillator();
-            h2.type = 'sine'; h2.frequency.value = freq * 2;
-            const h2Gain = ctx.createGain(); h2Gain.gain.value = 0.16;
-            h2.connect(h2Gain); h2Gain.connect(mix);
-
-            const h3 = ctx.createOscillator();
-            h3.type = 'sine'; h3.frequency.value = freq * 3;
-            const h3Gain = ctx.createGain(); h3Gain.gain.value = 0.06;
-            h3.connect(h3Gain); h3Gain.connect(mix);
-
-            // Breath: quiet enough the pitch never blurs — an attack
-            // transient plus a low sustained hiss, not a wash.
-            const breathSrc = ctx.createBufferSource();
-            breathSrc.buffer = getBreathNoiseBuffer(ctx);
-            breathSrc.loop = true;
-            const breathFilter = ctx.createBiquadFilter();
-            breathFilter.type = 'bandpass'; breathFilter.frequency.value = freq * 2.2; breathFilter.Q.value = 0.7;
-            const breathGain = ctx.createGain();
-            breathGain.gain.value = 0.035 + breath01 * 0.05 + energy * 0.02;
-            breathSrc.connect(breathFilter); breathFilter.connect(breathGain); breathGain.connect(mix);
-            breathSrc.start(now);
-
-            const vibrato = ctx.createOscillator();
-            vibrato.frequency.value = 4.6;
-            const vibGain = ctx.createGain(); vibGain.gain.value = 3;
-            vibrato.connect(vibGain);
-            vibGain.connect(fundamental.frequency); vibGain.connect(h2.frequency); vibGain.connect(h3.frequency);
-            vibrato.start(now);
+            const filter = ctx.createBiquadFilter();
+            filter.type = 'lowpass';
+            filter.Q.value = s.res;
+            const attackTime = Math.max(0.005, s.attack);
+            const targetCutoff = Math.min(nyquist, s.filterBase + s.filterEnv * (1 - yRatio) + velocity * 2000);
+            filter.frequency.setValueAtTime(Math.min(nyquist, s.filterBase), now);
+            filter.frequency.linearRampToValueAtTime(targetCutoff, now + attackTime);
+            const restCutoff = Math.min(nyquist, s.filterBase + (1 - yRatio) * 1000);
+            filter.frequency.setTargetAtTime(restCutoff, now + attackTime, Math.max(0.02, s.decay / 3));
+            mixGain.connect(filter);
 
             const ampGain = ctx.createGain();
             ampGain.gain.setValueAtTime(0.0001, now);
-            ampGain.gain.linearRampToValueAtTime(0.34 + energy * 0.12, now + 0.03);
-            mix.connect(ampGain);
-            const bus = sendToBus(ctx, ampGain, { dry: 1, reverb: 0.18 });
+            const peakVolume = 0.3 + velocity * 0.7;
+            ampGain.gain.linearRampToValueAtTime(peakVolume, now + attackTime);
+            ampGain.gain.linearRampToValueAtTime(peakVolume * s.sustain, now + attackTime + s.decay);
+            filter.connect(ampGain);
 
-            fundamental.start(now); h2.start(now); h3.start(now);
+            ampGain.connect(AudioEngine.voiceBus);
 
-            return {
-                setExpression(y01b) {
-                    const b = THREE.MathUtils.clamp(y01b, 0, 1);
-                    breathGain.gain.setTargetAtTime(0.035 + b * 0.05, ctx.currentTime, 0.08);
-                },
-                release(relTime) {
-                    const t = ctx.currentTime;
-                    const rel = relTime || 0.15;
-                    ampGain.gain.cancelScheduledValues(t);
-                    ampGain.gain.setTargetAtTime(0.0001, t, rel);
-                    const stopAt = t + rel * 4 + 0.05;
-                    try { fundamental.stop(stopAt); h2.stop(stopAt); h3.stop(stopAt); vibrato.stop(stopAt); breathSrc.stop(stopAt); } catch (e) {}
-                    setTimeout(() => {
-                        try {
-                            fundamentalGain.disconnect(); h2Gain.disconnect(); h3Gain.disconnect();
-                            breathFilter.disconnect(); breathGain.disconnect(); mix.disconnect();
-                            ampGain.disconnect(); vibGain.disconnect(); bus.disconnect();
-                        } catch (e) {}
-                    }, (stopAt - t) * 1000 + 100);
-                },
-            };
-        }
+            osc1.start(now);
+            osc2.start(now);
 
-        // =====================================================================
-        // NEY — breath-dominant, hollow and human: unlike the Whistle, the
-        // filtered-noise "air" column carries most of the character, over a
-        // soft fundamental and one weak harmonic, with two resonant "hollow"
-        // bands, irregular slow vibrato and a few cents of bounded random
-        // pitch drift — never enough to blur the scale degree.
-        // =====================================================================
-        function createNeyVoice(midi, y01, energy) {
-            const ctx = AudioEngine.ctx;
-            const now = ctx.currentTime;
-            const freq = midiToFreq(midi);
-            const air01 = THREE.MathUtils.clamp(y01, 0, 1);
-
-            const mix = ctx.createGain();
-            const fundamental = ctx.createOscillator();
-            fundamental.type = 'sine'; fundamental.frequency.value = freq;
-            const fundamentalGain = ctx.createGain(); fundamentalGain.gain.value = 0.55;
-            fundamental.connect(fundamentalGain); fundamentalGain.connect(mix);
-
-            const weakHarmonic = ctx.createOscillator();
-            weakHarmonic.type = 'sine'; weakHarmonic.frequency.value = freq * 2;
-            const weakHarmonicGain = ctx.createGain(); weakHarmonicGain.gain.value = 0.08;
-            weakHarmonic.connect(weakHarmonicGain); weakHarmonicGain.connect(mix);
-
-            // Two resonant "hollow" bands rather than one bandpass — this is
-            // the breath-dominant, chambered colour that separates Ney from
-            // Tin Whistle.
-            const breathSrc = ctx.createBufferSource();
-            breathSrc.buffer = getBreathNoiseBuffer(ctx);
-            breathSrc.loop = true;
-            const chamberBand = ctx.createBiquadFilter();
-            chamberBand.type = 'bandpass'; chamberBand.frequency.value = freq * 1.1; chamberBand.Q.value = 1.4;
-            const airBand = ctx.createBiquadFilter();
-            airBand.type = 'bandpass'; airBand.frequency.value = freq * 2.6; airBand.Q.value = 0.6;
-            const breathGain = ctx.createGain();
-            breathGain.gain.value = 0.12 + air01 * 0.1 + energy * 0.03;
-            breathSrc.connect(chamberBand); breathSrc.connect(airBand);
-            chamberBand.connect(breathGain); airBand.connect(breathGain); breathGain.connect(mix);
-            breathSrc.start(now);
-
-            // Irregular, slow vibrato — two summed LFOs at slightly different
-            // rates, rather than one clean sine.
-            const vib1 = ctx.createOscillator(); vib1.frequency.value = 0.55;
-            const vib2 = ctx.createOscillator(); vib2.frequency.value = 0.8;
-            const vibGain = ctx.createGain(); vibGain.gain.value = 2.5;
-            vib1.connect(vibGain); vib2.connect(vibGain);
-            vibGain.connect(fundamental.frequency); vibGain.connect(weakHarmonic.frequency);
-            vib1.start(now); vib2.start(now);
-
-            // A few cents of bounded random pitch drift, resampled
-            // periodically — organic instability that never obscures which
-            // scale degree this is.
-            const driftTimer = setInterval(() => {
-                const cents = (Math.random() * 2 - 1) * 5;
+            let released = false;
+            function doRelease(relTime) {
+                if (released) return;
+                released = true;
                 const t = ctx.currentTime;
-                fundamental.frequency.setTargetAtTime(freq * Math.pow(2, cents / 1200), t, 0.25);
-                weakHarmonic.frequency.setTargetAtTime(freq * 2 * Math.pow(2, cents / 1200), t, 0.25);
-            }, 700);
+                const rel = Math.max(0.02, relTime || s.release);
+                ampGain.gain.cancelScheduledValues(t);
+                ampGain.gain.setValueAtTime(ampGain.gain.value, t);
+                ampGain.gain.linearRampToValueAtTime(0.0001, t + rel);
+                const stopAt = t + rel + 0.05;
+                try { osc1.stop(stopAt); osc2.stop(stopAt); } catch (e) {}
+                setTimeout(() => {
+                    try { osc1.disconnect(); osc2.disconnect(); mixGain.disconnect(); filter.disconnect(); ampGain.disconnect(); } catch (e) {}
+                }, (stopAt - t) * 1000 + 100);
+            }
 
-            const ampGain = ctx.createGain();
-            ampGain.gain.setValueAtTime(0.0001, now);
-            ampGain.gain.linearRampToValueAtTime(0.3 + energy * 0.1, now + 0.14);
-            mix.connect(ampGain);
-
-            const ampWobble = ctx.createOscillator(); ampWobble.frequency.value = 3.1;
-            const ampWobbleGain = ctx.createGain(); ampWobbleGain.gain.value = 0.02;
-            ampWobble.connect(ampWobbleGain); ampWobbleGain.connect(ampGain.gain);
-            ampWobble.start(now);
-
-            const bus = sendToBus(ctx, ampGain, { dry: 1, reverb: 0.32 });
-            fundamental.start(now); weakHarmonic.start(now);
+            // A one-shot pluck (sustain ~= 0) has nothing left to hold once
+            // its decay phase ends, so it releases and cleans itself up
+            // automatically instead of waiting for an explicit release().
+            if (s.sustain <= 0.01) {
+                setTimeout(() => doRelease(s.release), (attackTime + s.decay) * 1000);
+            }
 
             return {
-                setExpression(y01b) {
-                    const a = THREE.MathUtils.clamp(y01b, 0, 1);
-                    breathGain.gain.setTargetAtTime(0.12 + a * 0.1, ctx.currentTime, 0.1);
-                },
-                release(relTime) {
-                    clearInterval(driftTimer);
+                setBrightness(yRatioNew) {
+                    if (released) return;
                     const t = ctx.currentTime;
-                    const rel = relTime || 0.2;
-                    ampGain.gain.cancelScheduledValues(t);
-                    ampGain.gain.setTargetAtTime(0.0001, t, rel);
-                    const stopAt = t + rel * 4 + 0.05;
-                    try { fundamental.stop(stopAt); weakHarmonic.stop(stopAt); vib1.stop(stopAt); vib2.stop(stopAt); ampWobble.stop(stopAt); breathSrc.stop(stopAt); } catch (e) {}
-                    setTimeout(() => {
-                        try {
-                            fundamentalGain.disconnect(); weakHarmonicGain.disconnect();
-                            chamberBand.disconnect(); airBand.disconnect(); breathGain.disconnect();
-                            mix.disconnect(); ampGain.disconnect(); vibGain.disconnect(); ampWobbleGain.disconnect(); bus.disconnect();
-                        } catch (e) {}
-                    }, (stopAt - t) * 1000 + 100);
+                    const cutoff = Math.min(nyquist, s.filterBase + s.filterEnv * (1 - yRatioNew) + velocity * 2000);
+                    filter.frequency.setTargetAtTime(cutoff, t, 0.05);
                 },
+                release(relTime) { doRelease(relTime); },
             };
         }
 
-        // =====================================================================
-        // HARMONICA — a reed-style additive stack (five harmonics, tapering
-        // amplitude) through a body resonance and a very mild *local*
-        // saturation — nasal and reedy, not a square wave through a global
-        // distortion bus. Exposes bend()/resolvePitch() so the scratch
-        // gesture (the only place normal play should bend a note) can nudge
-        // and settle the pitch back.
-        // =====================================================================
-        function createHarmonicaVoice(midi, y01, energy) {
-            const ctx = AudioEngine.ctx;
-            const now = ctx.currentTime;
-            const freq = midiToFreq(midi);
-            const breath01 = THREE.MathUtils.clamp(y01, 0, 1);
-
-            const mix = ctx.createGain();
-            const harmonicAmps = [1, 0.55, 0.32, 0.18, 0.1];
-            const oscs = harmonicAmps.map((amp, i) => {
-                const osc = ctx.createOscillator();
-                osc.type = 'sine';
-                osc.frequency.value = freq * (i + 1);
-                const g = ctx.createGain();
-                g.gain.value = amp * (i === 0 ? 1 : 0.7 + breath01 * 0.3);
-                osc.connect(g); g.connect(mix);
-                osc.start(now);
-                return { osc, g };
-            });
-
-            const body = ctx.createBiquadFilter();
-            body.type = 'peaking'; body.frequency.value = freq * 1.8; body.Q.value = 1.1; body.gain.value = 3.5;
-            mix.connect(body);
-
-            const saturator = ctx.createWaveShaper();
-            saturator.curve = makeSaturationCurve(0.1 + breath01 * 0.06);
-            body.connect(saturator);
-
-            const vibrato = ctx.createOscillator(); vibrato.frequency.value = 5.4;
-            const vibGain = ctx.createGain(); vibGain.gain.value = 3;
-            vibrato.connect(vibGain);
-            oscs.forEach(({ osc }) => vibGain.connect(osc.frequency));
-            vibrato.start(now);
-
-            const ampGain = ctx.createGain();
-            ampGain.gain.setValueAtTime(0.0001, now);
-            ampGain.gain.linearRampToValueAtTime(0.3 + energy * 0.15, now + 0.02);
-            saturator.connect(ampGain);
-
-            const breathWobble = ctx.createOscillator(); breathWobble.frequency.value = 6.5;
-            const breathWobbleGain = ctx.createGain(); breathWobbleGain.gain.value = 0.015;
-            breathWobble.connect(breathWobbleGain); breathWobbleGain.connect(ampGain.gain);
-            breathWobble.start(now);
-
-            const bus = sendToBus(ctx, ampGain, { dry: 1, reverb: 0.08 });
-
-            return {
-                setExpression(y01b) {
-                    const b = THREE.MathUtils.clamp(y01b, 0, 1);
-                    oscs.forEach(({ g }, i) => {
-                        if (i === 0) return;
-                        g.gain.setTargetAtTime(harmonicAmps[i] * (0.7 + b * 0.3), ctx.currentTime, 0.08);
-                    });
-                },
-                // Intentional expressive bend (scratch gesture only) — not
-                // used on normal note-to-note transitions.
-                bend(semitoneOffset, time) {
-                    const t = ctx.currentTime;
-                    oscs.forEach(({ osc }, i) => osc.frequency.setTargetAtTime(freq * (i + 1) * Math.pow(2, semitoneOffset / 12), t, time || 0.02));
-                },
-                resolvePitch(time) {
-                    const t = ctx.currentTime;
-                    oscs.forEach(({ osc }, i) => osc.frequency.setTargetAtTime(freq * (i + 1), t, time || 0.1));
-                },
-                release(relTime) {
-                    const t = ctx.currentTime;
-                    const rel = relTime || 0.15;
-                    ampGain.gain.cancelScheduledValues(t);
-                    ampGain.gain.setTargetAtTime(0.0001, t, rel);
-                    const stopAt = t + rel * 4 + 0.05;
-                    try { oscs.forEach(({ osc }) => osc.stop(stopAt)); vibrato.stop(stopAt); breathWobble.stop(stopAt); } catch (e) {}
-                    setTimeout(() => {
-                        try {
-                            oscs.forEach(({ g }) => g.disconnect());
-                            body.disconnect(); saturator.disconnect(); mix.disconnect();
-                            ampGain.disconnect(); vibGain.disconnect(); breathWobbleGain.disconnect(); bus.disconnect();
-                        } catch (e) {}
-                    }, (stopAt - t) * 1000 + 100);
-                },
-            };
-        }
-
-        // A minimal ambient tonic+fifth pad for worlds that opt in (Tin
-        // Whistle) — deliberately its own tiny voice, not a reuse of any of
-        // the five named instruments above.
+        // A minimal ambient tonic+fifth pad for worlds that opt in (Celtic) —
+        // a continuous drone doesn't fit the discrete attack/decay/release
+        // model above, so it stays its own tiny voice, feeding the same
+        // shared bus as every InstrumentVoice.
         function createAmbientDrone(freq) {
             const ctx = AudioEngine.ctx;
             const now = ctx.currentTime;
@@ -1290,8 +940,7 @@
             const ampGain = ctx.createGain();
             ampGain.gain.setValueAtTime(0.0001, now);
             ampGain.gain.linearRampToValueAtTime(0.045, now + 1.2);
-            osc.connect(filter); filter.connect(ampGain);
-            const bus = sendToBus(ctx, ampGain, { dry: 1, reverb: 0.25 });
+            osc.connect(filter); filter.connect(ampGain); ampGain.connect(AudioEngine.voiceBus);
             osc.start(now);
             return {
                 release(relTime) {
@@ -1301,7 +950,7 @@
                     ampGain.gain.setTargetAtTime(0.0001, t, rel);
                     const stopAt = t + rel * 4 + 0.05;
                     try { osc.stop(stopAt); } catch (e) {}
-                    setTimeout(() => { try { filter.disconnect(); ampGain.disconnect(); bus.disconnect(); } catch (e) {} }, (stopAt - t) * 1000 + 100);
+                    setTimeout(() => { try { filter.disconnect(); ampGain.disconnect(); } catch (e) {} }, (stopAt - t) * 1000 + 100);
                 },
             };
         }
@@ -1508,6 +1157,9 @@
                 key: 'chinese', name: 'Chinese · Gong', scaleName: 'Gong Pentatonic',
                 instrumentName: 'Guzheng', notesLabel: 'C · D · E · G · A',
                 intervals: SCALES.chineseGong, synthType: 'pluck',
+                baseMidi: 48, octaveSpan: 4,
+                synth: { type: 'sawtooth', attack: 0.01, decay: 2.0, sustain: 0.0, release: 2.5, filterBase: 800, filterEnv: 6000, res: 2, detune: 2 },
+                effects: { reverb: 0.5, delay: 0.3, distortion: 0 },
                 palette: { hue: 0.02, hueSpread: 0.05, satRange: [0.6, 0.9], lightRange: [0.45, 0.65], accentHue: 0.12, accentChance: 0.25 },
                 shapeKey: 'guzheng'
             },
@@ -1515,6 +1167,9 @@
                 key: 'japanese', name: 'Japanese · In Sen', scaleName: 'In Sen',
                 instrumentName: 'Koto', notesLabel: 'C · D♭ · F · G · B♭',
                 intervals: SCALES.japaneseInSen, synthType: 'pluck',
+                baseMidi: 48, octaveSpan: 4,
+                synth: { type: 'square', attack: 0.005, decay: 0.5, sustain: 0.0, release: 0.8, filterBase: 1000, filterEnv: 8000, res: 5, detune: 0 },
+                effects: { reverb: 0.7, delay: 0.2, distortion: 0 },
                 palette: { hue: 0.97, hueSpread: 0.04, satRange: [0.1, 0.35], lightRange: [0.55, 0.85], accentHue: 0.98, accentChance: 0.15 },
                 shapeKey: 'koto'
             },
@@ -1522,7 +1177,10 @@
                 key: 'celtic', name: 'Celtic · Dorian', scaleName: 'Dorian',
                 instrumentName: 'Tin Whistle', notesLabel: 'C · D · E♭ · F · G · A · B♭',
                 intervals: SCALES.celticDorian, synthType: 'sustain',
-                crossfadeMs: 30, graceChance: 0.1, drone: true,
+                baseMidi: 60, octaveSpan: 3,
+                crossfadeMs: 60, drone: true,
+                synth: { type: 'triangle', attack: 0.1, decay: 0.3, sustain: 0.8, release: 0.4, filterBase: 1500, filterEnv: 3000, res: 1, detune: 5 },
+                effects: { reverb: 0.6, delay: 0.4, distortion: 0 },
                 palette: { hue: 0.42, hueSpread: 0.08, satRange: [0.35, 0.7], lightRange: [0.45, 0.75], accentHue: 0.5, accentChance: 0.3 },
                 shapeKey: 'whistle'
             },
@@ -1530,7 +1188,10 @@
                 key: 'egyptian', name: 'Egyptian · Pentatonic', scaleName: 'Pentatonic',
                 instrumentName: 'Ney', notesLabel: 'C · D · F · G · B♭',
                 intervals: SCALES.egyptianPentatonic, synthType: 'sustain',
-                crossfadeMs: 80, graceChance: 0,
+                baseMidi: 60, octaveSpan: 3,
+                crossfadeMs: 90,
+                synth: { type: 'sine', attack: 0.15, decay: 0.4, sustain: 0.7, release: 0.6, filterBase: 800, filterEnv: 2000, res: 3, detune: 8 },
+                effects: { reverb: 0.4, delay: 0.2, distortion: 0.05 },
                 palette: { hue: 0.09, hueSpread: 0.05, satRange: [0.4, 0.75], lightRange: [0.4, 0.65], accentHue: 0.6, accentChance: 0.12 },
                 shapeKey: 'ney'
             },
@@ -1538,18 +1199,14 @@
                 key: 'blues', name: 'Blues · Minor Blues', scaleName: 'Minor Blues',
                 instrumentName: 'Blues Harmonica', notesLabel: 'C · E♭ · F · G♭ · G · B♭',
                 intervals: SCALES.bluesMinor, synthType: 'sustain',
-                crossfadeMs: 25, graceChance: 0,
+                baseMidi: 60, octaveSpan: 3,
+                crossfadeMs: 15,
+                synth: { type: 'square', attack: 0.08, decay: 0.2, sustain: 0.9, release: 0.3, filterBase: 2000, filterEnv: 5000, res: 8, detune: 10 },
+                effects: { reverb: 0.3, delay: 0.1, distortion: 0.6 },
                 palette: { hue: 0.62, hueSpread: 0.07, satRange: [0.55, 0.85], lightRange: [0.4, 0.65], accentHue: 0.1, accentChance: 0.15 },
                 shapeKey: 'harmonica'
             }
         ];
-
-        // Per-world dispatch into the five structurally distinct voice
-        // constructors above — the only place a "which instrument" branch
-        // exists; every instrument's actual DSP graph is fully hardcoded
-        // inside its own constructor.
-        const PLUCK_TRIGGERS = { chinese: triggerGuzhengPluck, japanese: triggerKotoPluck };
-        const WIND_VOICE_FACTORIES = { celtic: createTinWhistleVoice, egyptian: createNeyVoice, blues: createHarmonicaVoice };
 
         let currentWorldIndex = 0;
         function currentWorld() { return WORLDS[currentWorldIndex]; }
@@ -1582,6 +1239,7 @@
             applyWorldShape(world);
             if (particles) updatePaletteDesc(world.palette);
             applyWorldUI(world);
+            AudioEngine.applyWorldFX(world);
         }
 
         // ---- Pointer performance: X -> pitch (quantised to the current
@@ -1612,7 +1270,7 @@
         // so releasing and re-landing on the same zone still re-attacks. ----
         const noteResolvers = {};
         WORLDS.forEach((w) => {
-            noteResolvers[w.key] = createNoteResolver({ intervals: w.intervals, deadZone: 0.15, retriggerMs: 45 });
+            noteResolvers[w.key] = createNoteResolver({ intervals: w.intervals, baseMidi: w.baseMidi, octaveSpan: w.octaveSpan, deadZone: 0.15, retriggerMs: 45 });
         });
         function currentResolver() { return noteResolvers[currentWorld().key]; }
 
@@ -1625,7 +1283,7 @@
         }
         function startDroneIfNeeded(world) {
             if (!world.drone || droneVoices.length || !AudioEngine.started) return;
-            const tonicMidi = BASE_MIDI + world.intervals[0];
+            const tonicMidi = world.baseMidi + world.intervals[0];
             droneVoices = [createAmbientDrone(midiToFreq(tonicMidi)), createAmbientDrone(midiToFreq(tonicMidi + 7))];
         }
 
@@ -1633,46 +1291,26 @@
             const world = currentWorld();
             const { midi, changed } = currentResolver().resolve(x, performance.now());
             if (!changed) return;
-            const trigger = PLUCK_TRIGGERS[world.key];
-            if (trigger) trigger(midi, y, effectiveEnergy());
+            createInstrumentVoice(midiToFreq(midi), effectiveEnergy(), y, world);
             onNoteAttack(midi, world);
         }
 
-        // ---- Wind/reed worlds: every genuine scale-zone change starts a
-        // *new* voice (from that world's dedicated constructor) and releases
-        // the previous one on a short overlap (voice-crossfade), instead of
-        // retuning one live oscillator — that's what keeps this a legato
-        // sequence of discrete notes rather than a glide. ----
-        function spawnSustainVoice(world, midi, y, isTransition) {
+        // ---- Sustain worlds: every genuine scale-zone change starts a
+        // *new* InstrumentVoice at the exact target frequency and releases
+        // the previous one on a short, per-world overlap — never a live
+        // frequency ramp between two different notes. ----
+        function spawnSustainVoice(world, midi, y) {
             const energy = effectiveEnergy();
-            const factory = WIND_VOICE_FACTORIES[world.key];
-            if (!factory) return;
             const prevVoice = activeSustainVoice;
-
-            // Grace note: a short, quiet *separate* voice just before the
-            // real attack, gated to energetic gestures and low odds so it's
-            // an occasional ornament, not a glide on every note.
-            const graceChance = world.graceChance || 0;
-            const doGrace = isTransition && energy > 0.45 && Math.random() < graceChance;
-            const spawnDelayMs = doGrace ? 55 : 0;
-
-            if (doGrace) {
-                const graceMidi = midi + (Math.random() < 0.5 ? 2 : -2);
-                const graceVoice = factory(graceMidi, y, energy * 0.5);
-                setTimeout(() => graceVoice.release(0.05), 45);
-            }
-
-            setTimeout(() => {
-                const voice = factory(midi, y, energy);
-                activeSustainVoice = voice;
-                if (prevVoice) prevVoice.release((world.crossfadeMs || 40) / 1000);
-            }, spawnDelayMs);
+            const voice = createInstrumentVoice(midiToFreq(midi), energy, y, world);
+            activeSustainVoice = voice;
+            if (prevVoice) prevVoice.release((world.crossfadeMs || 40) / 1000);
         }
 
         function startSustainNote(world, x, y) {
             currentResolver().reset();
             const { midi } = currentResolver().resolve(x, performance.now());
-            spawnSustainVoice(world, midi, y, false);
+            spawnSustainVoice(world, midi, y);
             startDroneIfNeeded(world);
             onNoteAttack(midi, world);
         }
@@ -1680,10 +1318,10 @@
             if (!activeSustainVoice) return;
             const { midi, changed } = currentResolver().resolve(x, performance.now());
             if (changed) {
-                spawnSustainVoice(world, midi, y, true);
+                spawnSustainVoice(world, midi, y);
                 onNoteAttack(midi, world);
             } else {
-                activeSustainVoice.setExpression(y);
+                activeSustainVoice.setBrightness(y);
             }
         }
         function stopSustainNote() {
@@ -1755,7 +1393,7 @@
             noise.connect(filter);
             filter.connect(shaper);
             shaper.connect(burstGain);
-            burstGain.connect(AudioEngine.dry);
+            burstGain.connect(AudioEngine.compressor);
 
             const delayBoost = ctx.createGain();
             delayBoost.gain.value = 0.6;
@@ -1770,17 +1408,6 @@
             setTimeout(() => {
                 try { filter.disconnect(); shaper.disconnect(); burstGain.disconnect(); delayBoost.disconnect(); } catch (e) {}
             }, 500);
-
-            // Pitch bend is a deliberate scratch-gesture ornament, not the
-            // default note-transition system — only Harmonica exposes
-            // bend()/resolvePitch(), so Whistle/Ney get the burst/filter
-            // sweep above but never a pitch kick on their held note.
-            if (activeSustainVoice && typeof activeSustainVoice.bend === 'function') {
-                const semitones = dir > 0 ? 2.6 : -2.6;
-                activeSustainVoice.bend(semitones, 0.015);
-                const voice = activeSustainVoice;
-                setTimeout(() => { if (activeSustainVoice === voice) voice.resolvePitch(0.12); }, 90);
-            }
 
             scratchSpin = dir * (0.15 + intensity * 0.3);
             noteAttackPulse = Math.max(noteAttackPulse, 0.6);
