@@ -973,6 +973,36 @@
         }
         SHAPE_GENERATORS.ney = neyShape;
 
+        // Harmonica: a flat rectangular comb with a repeating row of reed
+        // holes — evenly spaced clusters rather than a continuous surface,
+        // so it visually reads as "ten holes in a row" even in particle form.
+        function harmonicaShape(i, N, out, o) {
+            const L = 200, W = 34, H = 16;
+            const bodyCount = Math.floor(N * 0.45);
+            const holeCount = Math.floor(N * 0.45);
+            const numHoles = 10;
+            let x, y, z;
+            if (i < bodyCount) {
+                x = (Math.random() - 0.5) * L;
+                y = (Math.random() - 0.5) * H;
+                z = (Math.random() - 0.5) * W;
+            } else if (i < bodyCount + holeCount) {
+                const h = Math.floor(Math.random() * numHoles);
+                const holeX = (h / (numHoles - 1) - 0.5) * L * 0.92;
+                const theta = Math.random() * Math.PI * 2;
+                const rr = Math.random() * 5;
+                x = holeX + Math.sin(theta) * rr;
+                y = (Math.random() - 0.5) * H * 0.5;
+                z = Math.cos(theta) * rr * 1.4;
+            } else {
+                x = (Math.random() - 0.5) * L * 1.05;
+                y = (Math.random() - 0.5) * H * 1.3;
+                z = (Math.random() - 0.5) * W * 1.15;
+            }
+            out[o] = x; out[o + 1] = y; out[o + 2] = z;
+        }
+        SHAPE_GENERATORS.harmonica = harmonicaShape;
+
         const WORLDS = [
             {
                 key: 'chinese', name: 'Chinese · Gong', scaleName: 'Gong Pentatonic',
@@ -1019,10 +1049,16 @@
             {
                 key: 'blues', name: 'Blues · Minor Blues', scaleName: 'Minor Blues',
                 instrumentName: 'Blues Harmonica', notesLabel: 'C · E♭ · F · G♭ · G · B♭',
-                intervals: [0, 3, 5, 6, 7, 10], synthType: 'pluck',
-                synth: { decay: 1.8, damping: 2600, feedback: 0.99, body: 500, bendChance: 0.3 },
+                intervals: [0, 3, 5, 6, 7, 10], synthType: 'sustain',
+                synth: {
+                    wave1: 'sawtooth', wave2: 'square', detuneCents: 11, breath: 0.03,
+                    attack: 0.03, peak: 0.32, filterBase: 700, filterRange: 2000, filterQ: 2.2,
+                    vibratoRate: 5.8, vibratoDepth: 6, glide: 0.05, graceChance: 0,
+                    distortion: 0.22, bendOnAttack: true, bendSemitones: 1.4
+                },
+                blueNoteDegree: 4, blueNoteTarget: 3,
                 palette: { hue: 0.62, hueSpread: 0.07, satRange: [0.55, 0.85], lightRange: [0.4, 0.65], accentHue: 0.1, accentChance: 0.15 },
-                shapeKey: 'guzheng'
+                shapeKey: 'harmonica'
             }
         ];
 
@@ -1075,6 +1111,25 @@
             return THREE.MathUtils.clamp(energyKnob * 0.7 + velBoost * 0.3, 0, 1);
         }
 
+        // ---- Scale quantisation with an optional "blue note" substitution:
+        // worlds like Blues can flag one scale degree (the natural 5th) to
+        // occasionally resolve to another (the flat 5th) instead, with the
+        // odds rising as ENERGY/gesture speed rises — a faster, more
+        // aggressive gesture reaches for the blue note more often. ----
+        function quantizeForWorld(world, x01) {
+            const intervals = world.intervals;
+            const clamped = THREE.MathUtils.clamp(x01, 0, 1);
+            const span = intervals.length * OCTAVE_SPAN;
+            const idx = Math.min(span - 1, Math.floor(clamped * span));
+            const octave = Math.floor(idx / intervals.length);
+            let degreeIndex = idx % intervals.length;
+            if (world.blueNoteDegree != null && degreeIndex === world.blueNoteDegree) {
+                const chance = 0.15 + effectiveEnergy() * 0.55;
+                if (Math.random() < chance) degreeIndex = world.blueNoteTarget;
+            }
+            return BASE_MIDI + octave * 12 + intervals[degreeIndex];
+        }
+
         // ---- Ambient tonic+fifth drone, only for worlds that opt in
         // (e.g. Tin Whistle). Lazily started on first note, stopped on
         // world switch. ----
@@ -1093,7 +1148,7 @@
 
         function playPluckAt(x, y) {
             const world = currentWorld();
-            const midi = quantizePitch(x, world.intervals);
+            const midi = quantizeForWorld(world, x);
             if (midi === pluckLastMidi) return;
             pluckLastMidi = midi;
             triggerPluck(midiToFreq(midi), brightnessFromY(y), effectiveEnergy(), world.synth);
@@ -1103,19 +1158,28 @@
         // voice glides between quantised pitches while held, instead of
         // retriggering per step, so melodies are legato rather than plucked.
         function startSustainNote(world, x, y) {
-            const midi = quantizePitch(x, world.intervals);
+            const midi = quantizeForWorld(world, x);
             pluckLastMidi = midi;
             const freq = midiToFreq(midi);
             const energy = effectiveEnergy();
             const cfg = Object.assign({}, world.synth, { peak: (world.synth.peak || 0.4) * (0.6 + energy * 0.6) });
-            activeSustainVoice = createSustainVoice(freq, cfg);
+            let startFreq = freq;
+            if (world.synth.bendOnAttack) {
+                startFreq = freq * Math.pow(2, -(world.synth.bendSemitones || 1) / 12);
+            }
+            activeSustainVoice = createSustainVoice(startFreq, cfg);
             activeSustainVoice.setBrightness(brightnessFromY(y));
+            if (world.synth.bendOnAttack) {
+                const resolveTime = 0.28 - energy * 0.18;
+                const voice = activeSustainVoice;
+                setTimeout(() => { if (activeSustainVoice === voice) voice.setFreq(freq, resolveTime); }, 10);
+            }
             startDroneIfNeeded(world);
             onNoteAttack(freq);
         }
         function glideSustainNote(world, x, y) {
             if (!activeSustainVoice) return;
-            const midi = quantizePitch(x, world.intervals);
+            const midi = quantizeForWorld(world, x);
             const freq = midiToFreq(midi);
             const grace = midi !== pluckLastMidi && Math.random() < (world.synth.graceChance || 0);
             pluckLastMidi = midi;
