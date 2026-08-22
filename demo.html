@@ -357,7 +357,15 @@
     <script>
         let scene, camera, renderer, starfield, particles;
         let ringGroups = new THREE.Group();
-        const PARTICLE_COUNT = 15000;
+
+        // Weak/mobile devices get fewer particles so input and audio stay
+        // responsive — playability matters more than particle density.
+        function detectParticleBudget() {
+            const isMobile = /Mobi|Android/i.test(navigator.userAgent) || window.innerWidth < 640;
+            const lowCores = (navigator.hardwareConcurrency || 8) <= 4;
+            return (isMobile || lowCores) ? 6000 : 15000;
+        }
+        const PARTICLE_COUNT = detectParticleBudget();
 
         let targetPositions = new Float32Array(PARTICLE_COUNT * 3);
         let currentPositions = new Float32Array(PARTICLE_COUNT * 3);
@@ -557,6 +565,35 @@
             });
             surface.addEventListener('pointerup', handlePointerUp);
             surface.addEventListener('pointercancel', handlePointerUp);
+
+            // Optional FX control: wheel over the instrument itself dials
+            // reverb space in/out, without touching page scroll (there is
+            // none — body is fixed/overflow-hidden).
+            surface.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                reverbWheelAmount = THREE.MathUtils.clamp(reverbWheelAmount + (e.deltaY > 0 ? -0.04 : 0.04), 0, 0.9);
+                if (AudioEngine.started) AudioEngine.setReverbAmount(reverbWheelAmount);
+            }, { passive: false });
+
+            // Two-finger vertical drag -> ENERGY, alongside the one-finger
+            // pitch+tone+play path already covered by pointer events.
+            let twoFingerLastY = null;
+            surface.addEventListener('touchstart', (e) => {
+                if (e.touches.length === 2) {
+                    twoFingerLastY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                }
+            }, { passive: true });
+            surface.addEventListener('touchmove', (e) => {
+                if (e.touches.length === 2 && twoFingerLastY != null) {
+                    e.preventDefault();
+                    const y = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                    setEnergyKnob(energyKnob + (twoFingerLastY - y) / window.innerHeight * 1.5);
+                    twoFingerLastY = y;
+                }
+            }, { passive: false });
+            surface.addEventListener('touchend', (e) => {
+                if (e.touches.length < 2) twoFingerLastY = null;
+            });
         }
 
         function createStarfield() {
@@ -1225,6 +1262,7 @@
         let scratchSpin = 0;
         let lastScratchTime = 0;
         const SCRATCH_VELOCITY_THRESHOLD = 1.6;
+        let reverbWheelAmount = 0.3;
 
         function effectiveEnergy() {
             const velBoost = THREE.MathUtils.clamp(pointerVelocity / 2.5, 0, 1);
