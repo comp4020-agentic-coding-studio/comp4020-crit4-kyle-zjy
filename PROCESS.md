@@ -1,9 +1,5 @@
 # Process overview
 
-<!-- TEMPLATE: this file is a shape to fill in, not a form. Replace everything
-     in it with your own overview, and delete this comment — `pnpm
-     check:evidence` will remind you if it's still here. -->
-
 A reading-guide to how the work came together --- a map to your process, not an
 essay about it. Markers read this file and follow its citations; they don't
 trawl the repo for evidence you didn't point at, so if a moment mattered, cite
@@ -17,60 +13,50 @@ cover every deliverable.
 
 ## What I built
 
-One paragraph: the thing, and the idea behind it.
+World Deck is a gesture-controlled audio-visual instrument styled as a DJ
+deck: a crossfader and energy control sweep between five world instruments
+(Chinese Guzheng, Japanese Koto, Celtic Tin Whistle, Egyptian Ney, Blues
+Harmonica), each with its own synth voice, scale, and particle silhouette,
+playable by mouse or by hand gesture (pitch/timbre from position, pinch for
+note-on/off, a scratch gesture for fast reversal, a two-finger pinch for
+energy) with the particle field breathing and sparking in time with the audio.
 
 ## The moments that mattered
 
-Three or four for an assignment; fewer is fine for a weekly prototype. Keep the
-list short so each moment has room to do all four jobs:
-
-1. **what happened** --- the problem, or the thing that went wrong
-2. **what you did instead of the obvious thing** --- the call you made, and why
-   it beat the obvious one
-3. **how you knew it was right** --- the check you ran, the viewport you looked
-   at, what you read before accepting the diff
-4. **the citation** --- a commit or commit range, a `CLAUDE.md` change, a check
-   that went from red to green, a prompt paired with the commit it produced
-
-Jobs 2 and 3 are the ones the repo can't tell a reader on its own, so they're
-where the marks are. The strongest moments are the ones where a correction
-landed in the **harness** --- the standards and checks your work has to satisfy
---- rather than in a retry: a rule added to `CLAUDE.md`, a check wired up, an
-attempt thrown away. Retrying until it passes is the routine case, and changing
-what the work runs against is the skilled one.
-
-Cite each moment as a link whose text is the commit hash or range and whose
-target is this repo's commit or compare URL, so a reader clicks straight to the
-evidence:
-
-- one commit: [`a1b2c3d`](https://github.com/YOUR-ORG/YOUR-REPO/commit/a1b2c3d)
-- a range:
-  [`a1b2c3d...e4f5a6b`](https://github.com/YOUR-ORG/YOUR-REPO/compare/a1b2c3d...e4f5a6b)
-
-To pair a prompt with the commit it produced, quote the prompt (curated, not a
-full transcript) next to the citation:
-
-> the prompt, verbatim
-
-Screenshots are welcome where one carries the verification better than a
-sentence does. Commit the file to this repo and link it with a **relative**
-path, which is what makes it render on GitHub: `![alt text](docs/before.png)`.
-Images don't count towards the word count and don't replace the citation.
-
-### A worked moment, for shape
-
-Delete this section along with the rest of the boilerplate --- it's here to show
-the four jobs in one paragraph, not to be imitated in content.
-
-> The date formatter kept coming back with `toLocaleDateString()` and no locale
-> argument, so the same build rendered differently on my machine and in CI. I'd
-> already re-prompted it twice, which fixed the line but not the habit, so the
-> third time I put the rule in `CLAUDE.md` instead
-> ([`3f9ac21`](https://github.com/YOUR-ORG/YOUR-REPO/commit/3f9ac21)) and added
-> a spec test that fails on a bare `toLocaleDateString`. That's what told me it
-> had actually taken: the test went red against the old code and green against
-> the new, and the next two features it wrote passed it without prompting
-> ([`3f9ac21...b7e0d14`](https://github.com/YOUR-ORG/YOUR-REPO/compare/3f9ac21...b7e0d14)).
+1. **Built the instrument in the wrong file for eleven commits.** World Deck
+   was built up stage by stage in `demo.html`
+   ([`fdc77fe`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-kyle-zjy/commit/fdc77fe)
+   through
+   [`c075ebd`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-kyle-zjy/commit/c075ebd)),
+   while `index.html` --- the file GitHub Pages actually serves at the site
+   root --- was still the untouched template starter page. The obvious fix
+   was to copy the finished markup over; instead I deleted the stale
+   `index.html` and renamed `demo.html` into its place, so there was exactly
+   one page and no risk of the two drifting apart
+   ([`f377a5a...23db18f`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-kyle-zjy/compare/f377a5a...23db18f)).
+   I knew it mattered because until that rename, everything I'd been checking
+   in the browser during dev was invisible to a marker looking at the
+   deployed root.
+2. **Deleting a test instead of patching its assertion.** The rename broke
+   `pnpm check`: `spec/starter.test.ts` still asserted the old starter page's
+   `data-testid="intro"` marker, which no longer existed. The quick fix would
+   have been to update the selector to something in World Deck. Instead I
+   read the test's own file --- `spec/README.md` calls it out as "a worked
+   example, not part of the always-on contract," meant to be replaced once
+   the starter page is --- and removed it outright rather than keep patching
+   an implementation-detail test to track a page it was never written for
+   ([`ba418eb`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-kyle-zjy/commit/ba418eb)).
+   `pnpm check` went from red (stale selector) to green with the invariants
+   in `spec/invariants.test.ts` still exercising the real, built `dist/`
+   output.
+3. **Removing dead code while wiring reactivity, not after.** Stage 8 added
+   audio-reactive particle breathing, sparkle, and note-attack shockwaves; in
+   the same commit I found `changeShape()` had gone dead once particle shape
+   was driven by the active world instead of a manual toggle, and removed it
+   rather than let it sit alongside the new reactive path
+   ([`607ef04`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-kyle-zjy/commit/607ef04)).
+   `pnpm typecheck` and `pnpm build` staying green through that commit is
+   what told me nothing else still called it.
 
 ## Before you ship
 
