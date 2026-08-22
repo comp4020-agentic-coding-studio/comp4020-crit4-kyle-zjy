@@ -4,8 +4,10 @@ import {
   createNoteResolver,
   midiToFreq,
   midiToName,
+  OCTAVE_SPAN,
   quantizeToMidi,
   SCALES,
+  zoneIndexForX,
 } from "../src/scale";
 
 // World Deck's spec: horizontal pointer position must select discrete notes
@@ -28,6 +30,31 @@ describe("quantizeToMidi", () => {
     expect(quantizeToMidi(0, intervals)).toBe(BASE_MIDI);
     const maxMidi = quantizeToMidi(1, intervals);
     expect(maxMidi).toBeLessThan(BASE_MIDI + 12 * 3);
+  });
+
+  for (const [name, intervals] of Object.entries(SCALES)) {
+    it(`${name}: spans the full intended octave range (reaches both the lowest and a top-octave note)`, () => {
+      const lowest = quantizeToMidi(0, intervals);
+      const highest = quantizeToMidi(1 - 1e-9, intervals);
+      expect(lowest).toBe(BASE_MIDI + intervals[0]);
+      expect(highest).toBeGreaterThanOrEqual(BASE_MIDI + 12 * (OCTAVE_SPAN - 1));
+      expect(highest).toBeLessThan(BASE_MIDI + 12 * OCTAVE_SPAN);
+    });
+  }
+
+  it("same-zone X movement always resolves to the same MIDI note across the full zone width", () => {
+    const intervals = SCALES.chineseGong;
+    const span = intervals.length * 3;
+    // Sample densely across zone index 2's full width and confirm every
+    // sample lands on the same MIDI note — movement inside a zone must
+    // never change pitch.
+    const zone = 2;
+    const midis = new Set<number>();
+    for (let i = 0; i < 20; i++) {
+      const x01 = (zone + i / 20) / span; // stays within [zone, zone+1) of the span
+      midis.add(quantizeToMidi(x01, intervals));
+    }
+    expect(midis.size).toBe(1);
   });
 });
 
@@ -76,6 +103,25 @@ describe("createNoteResolver: hysteresis", () => {
   it("first resolve() call always reports a change (the initial note-on)", () => {
     const resolver = createNoteResolver({ intervals: SCALES.chineseGong });
     expect(resolver.resolve(0.5, 0).changed).toBe(true);
+  });
+});
+
+describe("createNoteResolver: zone-gated note changes", () => {
+  it("only reports changed when the underlying quantized zone actually crosses a boundary", () => {
+    const intervals = SCALES.chineseGong;
+    const resolver = createNoteResolver({ intervals, deadZone: 0, retriggerMs: 0 });
+    const span = intervals.length * 3;
+    let now = 0;
+    let prevZone = resolver.resolve(0, now).zoneIndex;
+    for (let i = 1; i <= span * 2; i++) {
+      now += 10;
+      const x01 = i / (span * 2);
+      const expectedZone = zoneIndexForX(x01, intervals);
+      const { zoneIndex, changed } = resolver.resolve(x01, now);
+      expect(changed).toBe(zoneIndex !== prevZone);
+      if (changed) expect(zoneIndex).toBe(expectedZone);
+      prevZone = zoneIndex;
+    }
   });
 });
 
