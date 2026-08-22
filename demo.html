@@ -403,6 +403,8 @@
             initEnterOverlay();
             initPointerPerformance();
             initWorldButtons();
+            initWorldFader();
+            initEnergyControl();
         }
 
         function initEnterOverlay() {
@@ -418,6 +420,113 @@
         function initWorldButtons() {
             document.querySelectorAll('.world-btn').forEach((btn) => {
                 btn.addEventListener('click', () => switchWorld(Number(btn.dataset.world)));
+            });
+        }
+
+        // ---- WORLD crossfader: click, drag, wheel and arrow keys all move
+        // the same playhead. Position -> index is the single source of truth,
+        // shared with the compact buttons via switchWorld(). ----
+        function updateFaderVisual(index) {
+            const track = document.getElementById('world-fader-track');
+            const head = document.getElementById('world-fader-head');
+            const n = WORLDS.length;
+            const pct = 5 + (index / (n - 1)) * 90;
+            head.style.left = pct + '%';
+            track.setAttribute('aria-valuenow', String(index));
+            track.querySelectorAll('.world-tick').forEach((tick) => {
+                tick.classList.toggle('active', Number(tick.dataset.world) === index);
+            });
+        }
+
+        function initWorldFader() {
+            const track = document.getElementById('world-fader-track');
+            const n = WORLDS.length;
+
+            WORLDS.forEach((world, i) => {
+                const tick = document.createElement('div');
+                tick.className = 'world-tick';
+                tick.dataset.world = String(i);
+                tick.textContent = world.key.toUpperCase();
+                tick.style.left = (5 + (i / (n - 1)) * 90) + '%';
+                track.appendChild(tick);
+            });
+            updateFaderVisual(currentWorldIndex);
+
+            const indexFromClientX = (clientX) => {
+                const rect = track.getBoundingClientRect();
+                const t = THREE.MathUtils.clamp((clientX - rect.left) / rect.width, 0, 1);
+                return Math.round(t * (n - 1));
+            };
+
+            let dragging = false;
+            track.addEventListener('pointerdown', (e) => {
+                dragging = true;
+                track.setPointerCapture(e.pointerId);
+                switchWorld(indexFromClientX(e.clientX));
+            });
+            track.addEventListener('pointermove', (e) => {
+                if (dragging) switchWorld(indexFromClientX(e.clientX));
+            });
+            track.addEventListener('pointerup', () => { dragging = false; });
+            track.addEventListener('pointercancel', () => { dragging = false; });
+
+            track.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                switchWorld(currentWorldIndex + (e.deltaY > 0 ? 1 : -1));
+            }, { passive: false });
+
+            track.addEventListener('keydown', (e) => {
+                if (e.key === 'ArrowRight') { switchWorld(currentWorldIndex + 1); e.preventDefault(); }
+                else if (e.key === 'ArrowLeft') { switchWorld(currentWorldIndex - 1); e.preventDefault(); }
+            });
+        }
+
+        // ---- ENERGY control: circular meaning (CALM<->INTENSE), rendered as
+        // a horizontal fill for now. Drives rhythmic density, gain, harmonic
+        // brightness and particle dispersion via effectiveEnergy(). ----
+        function updateEnergyVisual(v01) {
+            const pct = Math.round(v01 * 100);
+            document.getElementById('energy-fill').style.width = pct + '%';
+            document.getElementById('energy-knob').style.left = pct + '%';
+            document.getElementById('energy-value').textContent = pct + '%';
+            const control = document.getElementById('energy-control');
+            control.setAttribute('aria-valuenow', String(pct));
+        }
+
+        function setEnergyKnob(v01) {
+            energyKnob = THREE.MathUtils.clamp(v01, 0, 1);
+            updateEnergyVisual(energyKnob);
+        }
+
+        function initEnergyControl() {
+            const control = document.getElementById('energy-control');
+            updateEnergyVisual(energyKnob);
+
+            const valueFromClientX = (clientX) => {
+                const rect = control.getBoundingClientRect();
+                return THREE.MathUtils.clamp((clientX - rect.left) / rect.width, 0, 1);
+            };
+
+            let dragging = false;
+            control.addEventListener('pointerdown', (e) => {
+                dragging = true;
+                control.setPointerCapture(e.pointerId);
+                setEnergyKnob(valueFromClientX(e.clientX));
+            });
+            control.addEventListener('pointermove', (e) => {
+                if (dragging) setEnergyKnob(valueFromClientX(e.clientX));
+            });
+            control.addEventListener('pointerup', () => { dragging = false; });
+            control.addEventListener('pointercancel', () => { dragging = false; });
+
+            control.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                setEnergyKnob(energyKnob + (e.deltaY > 0 ? -0.05 : 0.05));
+            }, { passive: false });
+
+            control.addEventListener('keydown', (e) => {
+                if (e.key === 'ArrowRight' || e.key === 'ArrowUp') { setEnergyKnob(energyKnob + 0.05); e.preventDefault(); }
+                else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') { setEnergyKnob(energyKnob - 0.05); e.preventDefault(); }
             });
         }
 
@@ -1081,6 +1190,7 @@
             document.querySelectorAll('.world-btn').forEach((b) => {
                 b.classList.toggle('text-blue-300', Number(b.dataset.world) === currentWorldIndex);
             });
+            updateFaderVisual(currentWorldIndex);
         }
 
         function switchWorld(index) {
