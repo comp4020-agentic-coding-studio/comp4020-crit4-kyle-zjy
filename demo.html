@@ -357,7 +357,6 @@
     <script>
         let scene, camera, renderer, starfield, particles;
         let ringGroups = new THREE.Group();
-        let coreColor = new THREE.Color(0x00f2ff);
         const PARTICLE_COUNT = 15000;
 
         let targetPositions = new Float32Array(PARTICLE_COUNT * 3);
@@ -397,19 +396,52 @@
                 particleOffsets[i*3+2] = (Math.random() - 0.5) * 150;
             }
 
-            changeShape('sphere');
+            applyWorldShape(currentWorld());
+            applyWorldUI(currentWorld());
             animate();
             initMediaPipe();
             initEnterOverlay();
+            initPointerPerformance();
+            initWorldButtons();
         }
 
         function initEnterOverlay() {
             const overlay = document.getElementById('enter-overlay');
             overlay.addEventListener('click', () => {
+                ensureAudioStarted();
                 overlay.classList.add('hidden');
                 targetDispersion = 0.9;
                 setTimeout(() => { targetDispersion = 0.05; }, 700);
             }, { once: true });
+        }
+
+        function initWorldButtons() {
+            document.querySelectorAll('.world-btn').forEach((btn) => {
+                btn.addEventListener('click', () => switchWorld(Number(btn.dataset.world)));
+            });
+        }
+
+        function initPointerPerformance() {
+            const surface = renderer.domElement;
+            surface.style.touchAction = 'none';
+
+            surface.addEventListener('pointerdown', (e) => {
+                surface.setPointerCapture(e.pointerId);
+                const x = e.clientX / window.innerWidth, y = e.clientY / window.innerHeight;
+                lastPointerX = x; lastPointerT = performance.now();
+                handlePointerDown(x, y);
+            });
+            surface.addEventListener('pointermove', (e) => {
+                const x = e.clientX / window.innerWidth, y = e.clientY / window.innerHeight;
+                const t = performance.now();
+                const dt = Math.max(1, t - lastPointerT);
+                pointerVelocity = Math.abs(x - lastPointerX) / (dt / 1000);
+                lastPointerX = x; lastPointerT = t;
+                pointerX = x; pointerY = y;
+                handlePointerMove(x, y);
+            });
+            surface.addEventListener('pointerup', handlePointerUp);
+            surface.addEventListener('pointercancel', handlePointerUp);
         }
 
         function createStarfield() {
@@ -449,27 +481,496 @@
             });
 
             particles = new THREE.Points(geometry, material);
-            updatePalette('#00f2ff');
+            updatePaletteDesc(WORLDS[currentWorldIndex].palette);
             scene.add(particles);
         }
 
-        function updatePalette(hex) {
-            coreColor.set(hex);
+        // ---- Palette: each world supplies a hue/saturation/lightness range
+        // plus an occasional accent hue, instead of one flat colour. ----
+        function updatePaletteDesc(desc) {
             const tempCol = new THREE.Color();
+            const spread = desc.hueSpread != null ? desc.hueSpread : 0.05;
             for (let i = 0; i < PARTICLE_COUNT; i++) {
-                tempCol.copy(coreColor);
-                const hsl = {};
-                tempCol.getHSL(hsl);
-                tempCol.setHSL(
-                    (hsl.h + (Math.random() - 0.5) * 0.4 + 1.0) % 1.0,
-                    THREE.MathUtils.clamp(hsl.s + (Math.random() - 0.5) * 0.2, 0.5, 1.0),
-                    THREE.MathUtils.clamp(hsl.l + (Math.random() - 0.5) * 0.3, 0.4, 0.8)
-                );
+                const useAccent = desc.accentHue != null && Math.random() < (desc.accentChance || 0);
+                const baseHue = useAccent ? desc.accentHue : desc.hue;
+                const hue = (baseHue + (Math.random() - 0.5) * spread + 1) % 1;
+                const sat = THREE.MathUtils.lerp(desc.satRange[0], desc.satRange[1], Math.random());
+                const light = THREE.MathUtils.lerp(desc.lightRange[0], desc.lightRange[1], Math.random());
+                tempCol.setHSL(hue, sat, light);
                 colors[i * 3] = tempCol.r;
                 colors[i * 3 + 1] = tempCol.g;
                 colors[i * 3 + 2] = tempCol.b;
             }
             particles.geometry.attributes.color.needsUpdate = true;
+        }
+
+        // =====================================================================
+        // AUDIO ENGINE — one shared master chain (gain -> compressor -> analyser
+        // -> destination) with reverb/delay sends and a generated impulse
+        // response, so no external audio assets are needed. Instruments are
+        // built as small per-note voice graphs that plug into engine.dry /
+        // engine.reverbSend / engine.delaySend.
+        // =====================================================================
+        const AudioEngine = {
+            ctx: null, masterGain: null, compressor: null, analyser: null,
+            dry: null, reverb: null, reverbSend: null,
+            delay: null, delayFeedback: null, delaySend: null,
+            started: false, freqData: null,
+
+            init() {
+                if (this.started) return;
+                this.started = true;
+                const Ctx = window.AudioContext || window.webkitAudioContext;
+                this.ctx = new Ctx();
+
+                this.masterGain = this.ctx.createGain();
+                this.masterGain.gain.value = 0.85;
+                this.compressor = this.ctx.createDynamicsCompressor();
+                this.compressor.threshold.value = -18;
+                this.compressor.ratio.value = 4;
+                this.analyser = this.ctx.createAnalyser();
+                this.analyser.fftSize = 512;
+                this.analyser.smoothingTimeConstant = 0.75;
+                this.freqData = new Uint8Array(this.analyser.frequencyBinCount);
+
+                this.masterGain.connect(this.compressor);
+                this.compressor.connect(this.analyser);
+                this.analyser.connect(this.ctx.destination);
+
+                this.dry = this.ctx.createGain();
+                this.dry.gain.value = 1;
+                this.dry.connect(this.masterGain);
+
+                this.reverb = this.ctx.createConvolver();
+                this.reverb.buffer = this._impulse(2.6, 2.4);
+                this.reverbSend = this.ctx.createGain();
+                this.reverbSend.gain.value = 0.3;
+                this.reverbSend.connect(this.reverb);
+                this.reverb.connect(this.masterGain);
+
+                this.delay = this.ctx.createDelay(1.0);
+                this.delay.delayTime.value = 0.3;
+                this.delayFeedback = this.ctx.createGain();
+                this.delayFeedback.gain.value = 0.22;
+                this.delaySend = this.ctx.createGain();
+                this.delaySend.gain.value = 0.0;
+                this.delaySend.connect(this.delay);
+                this.delay.connect(this.delayFeedback);
+                this.delayFeedback.connect(this.delay);
+                this.delay.connect(this.masterGain);
+            },
+
+            resume() {
+                if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+            },
+
+            _impulse(duration, decay) {
+                const rate = this.ctx.sampleRate;
+                const length = Math.floor(rate * duration);
+                const buf = this.ctx.createBuffer(2, length, rate);
+                for (let ch = 0; ch < 2; ch++) {
+                    const data = buf.getChannelData(ch);
+                    for (let i = 0; i < length; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, decay);
+                }
+                return buf;
+            },
+
+            setReverbAmount(amt) {
+                if (this.reverbSend) this.reverbSend.gain.setTargetAtTime(amt, this.ctx.currentTime, 0.1);
+            },
+
+            getBands() {
+                if (!this.analyser) return { bass: 0, mid: 0, high: 0, volume: 0 };
+                this.analyser.getByteFrequencyData(this.freqData);
+                const n = this.freqData.length;
+                const bassEnd = Math.floor(n * 0.12), midEnd = Math.floor(n * 0.5);
+                let bass = 0, mid = 0, high = 0;
+                for (let i = 0; i < bassEnd; i++) bass += this.freqData[i];
+                for (let i = bassEnd; i < midEnd; i++) mid += this.freqData[i];
+                for (let i = midEnd; i < n; i++) high += this.freqData[i];
+                bass /= (bassEnd * 255); mid /= ((midEnd - bassEnd) * 255); high /= ((n - midEnd) * 255);
+                return { bass, mid, high, volume: (bass + mid + high) / 3 };
+            }
+        };
+
+        function ensureAudioStarted() {
+            if (!AudioEngine.started) AudioEngine.init();
+            AudioEngine.resume();
+        }
+
+        // ---- Scale quantisation: the same normalised X always lands on the
+        // *current world's* scale, several octaves wide. This one function is
+        // the heart of "same gesture, different musical language". ----
+        const BASE_MIDI = 48; // C3
+        const OCTAVE_SPAN = 3;
+
+        function quantizePitch(x01, intervals) {
+            const clamped = THREE.MathUtils.clamp(x01, 0, 1);
+            const span = intervals.length * OCTAVE_SPAN;
+            const idx = Math.min(span - 1, Math.floor(clamped * span));
+            const octave = Math.floor(idx / intervals.length);
+            const degree = intervals[idx % intervals.length];
+            return BASE_MIDI + octave * 12 + degree;
+        }
+        function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+        function brightnessFromY(y01) { return 1 - THREE.MathUtils.clamp(y01, 0, 1); }
+
+        // ---- Shared synthesis helpers ----
+        function makeNoiseBuffer(ctx, duration) {
+            const len = Math.max(1, Math.floor(ctx.sampleRate * duration));
+            const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+            const d = buf.getChannelData(0);
+            for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+            return buf;
+        }
+        let _breathNoiseBuffer = null;
+        function getBreathNoiseBuffer(ctx) {
+            if (!_breathNoiseBuffer) _breathNoiseBuffer = makeNoiseBuffer(ctx, 2.0);
+            return _breathNoiseBuffer;
+        }
+        function makeDistortionCurve(amount) {
+            const k = amount * 100;
+            const n = 2048;
+            const curve = new Float32Array(n);
+            for (let i = 0; i < n; i++) {
+                const x = (i * 2) / n - 1;
+                curve[i] = ((1 + k) * x) / (1 + k * Math.abs(x));
+            }
+            return curve;
+        }
+
+        // ---- Plucked-string voice (Karplus-Strong): a short noise burst
+        // excites a delay-line feedback loop tuned to the note's period, damped
+        // by a lowpass in the loop. Guzheng and Koto both use this with
+        // different decay/damping/body-resonance parameters, which is what
+        // makes two "plucked string" worlds sound distinct rather than
+        // recoloured copies of each other. ----
+        function triggerPluck(freq, brightness, energy, cfg) {
+            const ctx = AudioEngine.ctx;
+            const now = ctx.currentTime;
+            const c = Object.assign({ decay: 2.0, damping: 4000, feedback: 0.99, body: 900, bendChance: 0.15 }, cfg);
+
+            const burst = ctx.createBufferSource();
+            burst.buffer = makeNoiseBuffer(ctx, 0.008);
+
+            const exciteFilter = ctx.createBiquadFilter();
+            exciteFilter.type = 'bandpass';
+            exciteFilter.frequency.value = freq;
+            exciteFilter.Q.value = 1.5;
+
+            const delay = ctx.createDelay(0.05);
+            delay.delayTime.value = 1 / freq;
+
+            const damping = ctx.createBiquadFilter();
+            damping.type = 'lowpass';
+            damping.frequency.value = c.damping * (0.6 + brightness * 0.8);
+
+            const feedbackGain = ctx.createGain();
+            feedbackGain.gain.value = c.feedback;
+
+            const bodyFilter = ctx.createBiquadFilter();
+            bodyFilter.type = 'peaking';
+            bodyFilter.frequency.value = c.body;
+            bodyFilter.gain.value = 4;
+            bodyFilter.Q.value = 0.8;
+
+            const outGain = ctx.createGain();
+            outGain.gain.setValueAtTime(0.0001, now);
+            outGain.gain.linearRampToValueAtTime(0.5 + energy * 0.3, now + 0.003);
+            const sustainTime = c.decay * (0.5 + energy * 0.9);
+            outGain.gain.setTargetAtTime(0.0001, now + 0.02, sustainTime / 4);
+
+            burst.connect(exciteFilter);
+            exciteFilter.connect(delay);
+            delay.connect(damping);
+            damping.connect(feedbackGain);
+            feedbackGain.connect(delay);
+            damping.connect(bodyFilter);
+            bodyFilter.connect(outGain);
+
+            outGain.connect(AudioEngine.dry);
+            outGain.connect(AudioEngine.reverbSend);
+
+            burst.start(now);
+            burst.stop(now + 0.01);
+
+            if (Math.random() < c.bendChance) {
+                const bendFactor = 1 + (Math.random() * 0.06 - 0.03);
+                delay.delayTime.setValueAtTime(1 / freq, now + 0.04);
+                delay.delayTime.linearRampToValueAtTime(1 / (freq * bendFactor), now + 0.19);
+            }
+
+            const stopAt = now + sustainTime + 0.3;
+            setTimeout(() => {
+                try {
+                    delay.disconnect(); feedbackGain.disconnect(); damping.disconnect();
+                    bodyFilter.disconnect(); outGain.disconnect(); exciteFilter.disconnect();
+                } catch (e) {}
+            }, (stopAt - now) * 1000 + 100);
+
+            onNoteAttack(freq);
+        }
+
+        // ---- Continuous "breath/reed" voice: two oscillators (for reed beat
+        // or unison width) + optional breath-noise layer + optional distortion,
+        // through a filter that tracks timbre. Tin Whistle, Ney and Harmonica
+        // are all this engine with very different parameters (breath amount,
+        // attack time, distortion, vibrato, pitch drift), not the same synth
+        // recoloured. Not yet used by an active world — wired up in a later
+        // stage alongside those instruments. ----
+        function createSustainVoice(freq, desc) {
+            const ctx = AudioEngine.ctx;
+            const now = ctx.currentTime;
+
+            const osc1 = ctx.createOscillator();
+            osc1.type = desc.wave1 || 'triangle';
+            osc1.frequency.value = freq;
+            const osc2 = ctx.createOscillator();
+            osc2.type = desc.wave2 || desc.wave1 || 'triangle';
+            osc2.frequency.value = freq * Math.pow(2, (desc.detuneCents || 0) / 1200);
+
+            const mixGain = ctx.createGain();
+            osc1.connect(mixGain);
+            osc2.connect(mixGain);
+
+            let node = mixGain;
+            if (desc.distortion) {
+                const shaper = ctx.createWaveShaper();
+                shaper.curve = makeDistortionCurve(desc.distortion);
+                node.connect(shaper);
+                node = shaper;
+            }
+
+            const filter = ctx.createBiquadFilter();
+            filter.type = 'bandpass';
+            filter.frequency.value = desc.filterBase || freq * 2;
+            filter.Q.value = desc.filterQ || 1;
+            node.connect(filter);
+
+            let breathSrc = null;
+            if (desc.breath) {
+                breathSrc = ctx.createBufferSource();
+                breathSrc.buffer = getBreathNoiseBuffer(ctx);
+                breathSrc.loop = true;
+                const breathFilter = ctx.createBiquadFilter();
+                breathFilter.type = 'bandpass';
+                breathFilter.frequency.value = freq * 1.5;
+                breathFilter.Q.value = 0.8;
+                const breathGain = ctx.createGain();
+                breathGain.gain.value = desc.breath;
+                breathSrc.connect(breathFilter);
+                breathFilter.connect(breathGain);
+                breathGain.connect(filter);
+                breathSrc.start(now);
+            }
+
+            const ampGain = ctx.createGain();
+            ampGain.gain.setValueAtTime(0.0001, now);
+            ampGain.gain.linearRampToValueAtTime(desc.peak || 0.5, now + (desc.attack || 0.05));
+            filter.connect(ampGain);
+
+            let vibrato = null;
+            if (desc.vibratoRate) {
+                vibrato = ctx.createOscillator();
+                vibrato.frequency.value = desc.vibratoRate;
+                const vibGain = ctx.createGain();
+                vibGain.gain.value = desc.vibratoDepth || 3;
+                vibrato.connect(vibGain);
+                vibGain.connect(osc1.frequency);
+                vibGain.connect(osc2.frequency);
+                vibrato.start(now);
+            }
+
+            ampGain.connect(AudioEngine.dry);
+            ampGain.connect(AudioEngine.reverbSend);
+            osc1.start(now); osc2.start(now);
+
+            return {
+                osc1, osc2, ampGain, filter,
+                setFreq(f, glide) {
+                    const t = ctx.currentTime;
+                    osc1.frequency.setTargetAtTime(f, t, glide || 0.05);
+                    osc2.frequency.setTargetAtTime(f * Math.pow(2, (desc.detuneCents || 0) / 1200), t, glide || 0.05);
+                },
+                setBrightness(b01) {
+                    const t = ctx.currentTime;
+                    filter.frequency.setTargetAtTime((desc.filterBase || 400) + b01 * (desc.filterRange || 4000), t, 0.05);
+                },
+                release(relTime) {
+                    const t = ctx.currentTime;
+                    const rel = relTime || 0.2;
+                    ampGain.gain.cancelScheduledValues(t);
+                    ampGain.gain.setTargetAtTime(0.0001, t, rel);
+                    const stopAt = t + rel * 4 + 0.05;
+                    try {
+                        osc1.stop(stopAt); osc2.stop(stopAt);
+                        if (vibrato) vibrato.stop(stopAt);
+                        if (breathSrc) breathSrc.stop(stopAt);
+                    } catch (e) {}
+                }
+            };
+        }
+
+        function onNoteAttack(freq) {
+            // Visual hook (shockwave / highlighted region): wired up once the
+            // audio-reactive particle stage lands.
+        }
+
+        // =====================================================================
+        // MUSICAL WORLDS — each entry is the single source of truth for one
+        // world's scale, instrument, particle silhouette and palette. Worlds
+        // 2-5 currently borrow the guzheng pluck engine and silhouette with
+        // their own scale/palette; later stages give each its own instrument
+        // voice and particle shape.
+        // =====================================================================
+        const SHAPE_GENERATORS = {};
+
+        // Guzheng: long curved rectangular body, parallel strings, and
+        // diagonal bridge clusters (denser particle knots).
+        function guzhengShape(i, N, out, o) {
+            const L = 260, W = 84, H = 16;
+            const bodyCount = Math.floor(N * 0.55);
+            const stringCount = Math.floor(N * 0.35);
+            const numStrings = 18;
+            let x, y, z;
+            if (i < bodyCount) {
+                const u = Math.random();
+                const v = Math.random() - 0.5;
+                x = (u - 0.5) * L;
+                z = v * W;
+                y = Math.sin(u * Math.PI) * H + (Math.random() - 0.5) * 4;
+            } else if (i < bodyCount + stringCount) {
+                const s = Math.floor(Math.random() * numStrings);
+                const stringZ = (s / (numStrings - 1) - 0.5) * (W * 0.9);
+                const u = Math.random();
+                x = (u - 0.5) * L;
+                z = stringZ + (Math.random() - 0.5) * 0.8;
+                y = Math.sin(u * Math.PI) * H + 2 + (Math.random() - 0.5) * 0.6;
+            } else {
+                const s = Math.floor(Math.random() * numStrings);
+                const stringZ = (s / (numStrings - 1) - 0.5) * (W * 0.9);
+                const bridgeU = 0.28 + (s / numStrings) * 0.46;
+                x = (bridgeU - 0.5) * L + (Math.random() - 0.5) * 6;
+                z = stringZ + (Math.random() - 0.5) * 3;
+                y = Math.sin(bridgeU * Math.PI) * H + 5 + (Math.random() - 0.5) * 3;
+            }
+            out[o] = x; out[o + 1] = y; out[o + 2] = z;
+        }
+        SHAPE_GENERATORS.guzheng = guzhengShape;
+
+        const WORLDS = [
+            {
+                key: 'chinese', name: 'Chinese · Gong', scaleName: 'Gong Pentatonic',
+                instrumentName: 'Guzheng', notesLabel: 'C · D · E · G · A',
+                intervals: [0, 2, 4, 7, 9], synthType: 'pluck',
+                synth: { decay: 2.4, damping: 3600, feedback: 0.992, body: 850, bendChance: 0.18 },
+                palette: { hue: 0.02, hueSpread: 0.05, satRange: [0.6, 0.9], lightRange: [0.45, 0.65], accentHue: 0.12, accentChance: 0.25 },
+                shapeKey: 'guzheng'
+            },
+            {
+                key: 'japanese', name: 'Japanese · In Sen', scaleName: 'In Sen',
+                instrumentName: 'Koto', notesLabel: 'C · D♭ · F · G · B♭',
+                intervals: [0, 1, 5, 7, 10], synthType: 'pluck',
+                synth: { decay: 1.1, damping: 6200, feedback: 0.982, body: 1400, bendChance: 0.06 },
+                palette: { hue: 0.97, hueSpread: 0.04, satRange: [0.1, 0.35], lightRange: [0.55, 0.85], accentHue: 0.98, accentChance: 0.15 },
+                shapeKey: 'guzheng'
+            },
+            {
+                key: 'celtic', name: 'Celtic · Dorian', scaleName: 'Dorian',
+                instrumentName: 'Tin Whistle', notesLabel: 'C · D · E♭ · F · G · A · B♭',
+                intervals: [0, 2, 3, 5, 7, 9, 10], synthType: 'pluck',
+                synth: { decay: 1.6, damping: 4200, feedback: 0.988, body: 700, bendChance: 0.12 },
+                palette: { hue: 0.42, hueSpread: 0.08, satRange: [0.35, 0.7], lightRange: [0.45, 0.75], accentHue: 0.5, accentChance: 0.3 },
+                shapeKey: 'guzheng'
+            },
+            {
+                key: 'egyptian', name: 'Egyptian · Pentatonic', scaleName: 'Pentatonic',
+                instrumentName: 'Ney', notesLabel: 'C · D · F · G · B♭',
+                intervals: [0, 2, 5, 7, 10], synthType: 'pluck',
+                synth: { decay: 2.0, damping: 3000, feedback: 0.99, body: 600, bendChance: 0.1 },
+                palette: { hue: 0.09, hueSpread: 0.05, satRange: [0.4, 0.75], lightRange: [0.4, 0.65], accentHue: 0.6, accentChance: 0.12 },
+                shapeKey: 'guzheng'
+            },
+            {
+                key: 'blues', name: 'Blues · Minor Blues', scaleName: 'Minor Blues',
+                instrumentName: 'Blues Harmonica', notesLabel: 'C · E♭ · F · G♭ · G · B♭',
+                intervals: [0, 3, 5, 6, 7, 10], synthType: 'pluck',
+                synth: { decay: 1.8, damping: 2600, feedback: 0.99, body: 500, bendChance: 0.3 },
+                palette: { hue: 0.62, hueSpread: 0.07, satRange: [0.55, 0.85], lightRange: [0.4, 0.65], accentHue: 0.1, accentChance: 0.15 },
+                shapeKey: 'guzheng'
+            }
+        ];
+
+        let currentWorldIndex = 0;
+        function currentWorld() { return WORLDS[currentWorldIndex]; }
+
+        function applyWorldShape(world) {
+            const gen = SHAPE_GENERATORS[world.shapeKey] || SHAPE_GENERATORS.guzheng;
+            for (let i = 0; i < PARTICLE_COUNT; i++) gen(i, PARTICLE_COUNT, targetPositions, i * 3);
+        }
+
+        function applyWorldUI(world) {
+            document.getElementById('panel-world').textContent = world.name;
+            document.getElementById('panel-instrument').textContent = world.instrumentName;
+            document.getElementById('panel-scale').textContent = world.notesLabel;
+            document.querySelector('#center-label .world-name').textContent = world.name;
+            document.querySelector('#center-label .world-scale-name').textContent = world.scaleName;
+            document.querySelector('#center-label .instrument-name').textContent = world.instrumentName;
+            document.querySelector('#center-label .scale-notes').textContent = world.notesLabel;
+            document.querySelectorAll('.world-btn').forEach((b) => {
+                b.classList.toggle('text-blue-300', Number(b.dataset.world) === currentWorldIndex);
+            });
+        }
+
+        function switchWorld(index) {
+            const clamped = THREE.MathUtils.clamp(index, 0, WORLDS.length - 1);
+            currentWorldIndex = clamped;
+            const world = currentWorld();
+            releaseHeldNote();
+            applyWorldShape(world);
+            if (particles) updatePaletteDesc(world.palette);
+            applyWorldUI(world);
+        }
+
+        // ---- Pointer performance: X -> pitch (quantised to the current
+        // world's scale), Y -> brightness/timbre, hold -> play, drag speed ->
+        // performance energy. ----
+        let pointerHeld = false;
+        let pointerX = 0.5, pointerY = 0.5;
+        let pointerVelocity = 0;
+        let lastPointerX = 0.5, lastPointerT = 0;
+        let pluckLastMidi = null;
+        let energyKnob = 0.4;
+
+        function effectiveEnergy() {
+            const velBoost = THREE.MathUtils.clamp(pointerVelocity / 2.5, 0, 1);
+            return THREE.MathUtils.clamp(energyKnob * 0.7 + velBoost * 0.3, 0, 1);
+        }
+
+        function playPluckAt(x, y) {
+            const world = currentWorld();
+            const midi = quantizePitch(x, world.intervals);
+            if (midi === pluckLastMidi) return;
+            pluckLastMidi = midi;
+            triggerPluck(midiToFreq(midi), brightnessFromY(y), effectiveEnergy(), world.synth);
+        }
+
+        function releaseHeldNote() {
+            pluckLastMidi = null;
+        }
+
+        function handlePointerDown(x, y) {
+            ensureAudioStarted();
+            pointerHeld = true;
+            pluckLastMidi = null;
+            playPluckAt(x, y);
+        }
+        function handlePointerMove(x, y) {
+            if (pointerHeld) playPluckAt(x, y);
+        }
+        function handlePointerUp() {
+            pointerHeld = false;
+            releaseHeldNote();
         }
 
         function createEpicRings() {
