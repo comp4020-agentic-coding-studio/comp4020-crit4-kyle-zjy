@@ -923,9 +923,9 @@
             };
         }
 
+        let noteAttackPulse = 0;
         function onNoteAttack(freq) {
-            // Visual hook (shockwave / highlighted region): wired up once the
-            // audio-reactive particle stage lands.
+            noteAttackPulse = 1.0;
         }
 
         // =====================================================================
@@ -1333,11 +1333,13 @@
             releaseHeldNote();
         }
 
+        let ringLayerMeshes = [];
         function createEpicRings() {
             ringGroups.clear();
+            ringLayerMeshes = [];
             const ringConfigs = [
-                { r: 210, w: 20, count: 800, color: 0xffffff, op: 0.2 },
-                { r: 280, w: 40, count: 1000, color: 0x00f2ff, op: 0.1 }
+                { r: 210, w: 20, count: 800, color: 0xffffff, op: 0.2, band: 'mid' },
+                { r: 280, w: 40, count: 1000, color: 0x00f2ff, op: 0.1, band: 'bass' }
             ];
             ringConfigs.forEach((config) => {
                 const geo = new THREE.BufferGeometry();
@@ -1352,55 +1354,11 @@
                     color: config.color, size: 1.5, transparent: true, opacity: config.op, blending: THREE.AdditiveBlending
                 }));
                 p.rotation.x = Math.PI * 0.45;
+                p.userData.band = config.band;
+                p.userData.baseOpacity = config.op;
                 ringGroups.add(p);
+                ringLayerMeshes.push(p);
             });
-        }
-
-        function changeShape(type) {
-            for (let i = 0; i < PARTICLE_COUNT; i++) {
-                let x, y, z;
-                if (type === 'saturn') {
-                    if (i < PARTICLE_COUNT * 0.5) {
-                        const phi = Math.acos(-1 + (2 * i) / (PARTICLE_COUNT * 0.5));
-                        const theta = Math.sqrt(PARTICLE_COUNT * 0.5 * Math.PI) * phi;
-                        const r = 90;
-                        x = r * Math.cos(theta) * Math.sin(phi);
-                        y = r * Math.sin(theta) * Math.sin(phi);
-                        z = r * Math.cos(phi);
-                    } else {
-                        const a = Math.random() * Math.PI * 2;
-                        const r = 130 + Math.random() * 60;
-                        x = Math.cos(a) * r;
-                        y = (Math.random() - 0.5) * 4;
-                        z = Math.sin(a) * r;
-                    }
-                } else if (type === 'hollow_heart') {
-                    const t = Math.random() * Math.PI * 2;
-                    const p = (Math.random() - 0.5) * Math.PI;
-                    const scale = 8;
-                    x = 16 * Math.pow(Math.sin(t), 3);
-                    y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
-                    z = Math.sin(p) * 15;
-                    x *= scale; y *= scale; z *= scale;
-                } else if (type === 'tree') {
-                    const h = Math.random() * 240;
-                    const r = (240 - h) * 0.4;
-                    const a = h * 0.6 + i * 0.05;
-                    x = Math.cos(a) * r;
-                    y = h - 120;
-                    z = Math.sin(a) * r;
-                } else if (type === 'sphere') {
-                    const phi = Math.acos(-1 + (2 * i) / PARTICLE_COUNT);
-                    const theta = Math.sqrt(PARTICLE_COUNT * Math.PI) * phi;
-                    const r = 110;
-                    x = r * Math.cos(theta) * Math.sin(phi);
-                    y = r * Math.sin(theta) * Math.sin(phi);
-                    z = r * Math.cos(phi);
-                }
-                targetPositions[i*3] = x;
-                targetPositions[i*3+1] = y;
-                targetPositions[i*3+2] = z;
-            }
         }
 
         function initMediaPipe() {
@@ -1464,16 +1422,39 @@
             }
         }
 
+        const bandsSmoothed = { bass: 0, mid: 0, high: 0, volume: 0 };
+
         function animate() {
             requestAnimationFrame(animate);
+
+            const bands = AudioEngine.started ? AudioEngine.getBands() : { bass: 0, mid: 0, high: 0, volume: 0 };
+            bandsSmoothed.bass += (bands.bass - bandsSmoothed.bass) * 0.15;
+            bandsSmoothed.mid += (bands.mid - bandsSmoothed.mid) * 0.15;
+            bandsSmoothed.high += (bands.high - bandsSmoothed.high) * 0.2;
+            bandsSmoothed.volume += (bands.volume - bandsSmoothed.volume) * 0.1;
+            noteAttackPulse *= 0.9;
 
             currentRotX += (targetRotX - currentRotX) * 0.05;
             currentRotY += (targetRotY - currentRotY) * 0.05;
 
             particles.rotation.x += currentRotX;
             particles.rotation.y += currentRotY;
+            const idleSpin = 0.0016 + energyKnob * 0.003;
             ringGroups.rotation.x += currentRotX * 0.8;
-            ringGroups.rotation.y += currentRotY * 0.8;
+            ringGroups.rotation.y += currentRotY * 0.8 + idleSpin;
+
+            // Low-frequency energy -> the instrument "breathes"; a note
+            // attack adds a brief shockwave pulse on top.
+            const breathScale = 1 + bandsSmoothed.bass * 0.07 + noteAttackPulse * 0.09;
+            particles.scale.setScalar(breathScale);
+            particles.material.size = 3.0 + bandsSmoothed.high * 3.5;
+            particles.material.opacity = THREE.MathUtils.clamp(0.8 + bandsSmoothed.volume * 0.2, 0, 1);
+
+            ringLayerMeshes.forEach((mesh) => {
+                const band = bandsSmoothed[mesh.userData.band] || 0;
+                mesh.scale.setScalar(1 + band * 0.3 + noteAttackPulse * 0.15);
+                mesh.material.opacity = mesh.userData.baseOpacity * (1 + band * 1.5);
+            });
 
             currentDispersion += (targetDispersion - currentDispersion) * 0.04;
 
