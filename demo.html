@@ -892,6 +892,48 @@
         }
         SHAPE_GENERATORS.koto = kotoShape;
 
+        // Tin whistle: a slim cylindrical tube with six finger-hole clusters,
+        // a mouthpiece knot at one end, and a thin stream of "airflow"
+        // particles drifting along the bore.
+        function whistleShape(i, N, out, o) {
+            const L = 210, R = 9;
+            const bodyCount = Math.floor(N * 0.58);
+            const holeCount = Math.floor(N * 0.28);
+            const mouthCount = Math.floor(N * 0.09);
+            const numHoles = 6;
+            let x, y, z;
+            if (i < bodyCount) {
+                const u = Math.random();
+                const theta = Math.random() * Math.PI * 2;
+                x = (u - 0.42) * L;
+                y = Math.sin(theta) * R;
+                z = Math.cos(theta) * R;
+            } else if (i < bodyCount + holeCount) {
+                const h = Math.floor(Math.random() * numHoles);
+                const holeU = 0.08 + (h / (numHoles - 1)) * 0.62;
+                const theta = (Math.random() - 0.5) * 1.1 + Math.PI / 2;
+                const jitter = Math.random() * 2.4;
+                x = (holeU - 0.42) * L + (Math.random() - 0.5) * 3;
+                y = Math.sin(theta) * (R + jitter);
+                z = Math.cos(theta) * (R + jitter);
+            } else if (i < bodyCount + holeCount + mouthCount) {
+                x = (0.08 - 0.42) * L + (Math.random() - 0.5) * 8 - 6;
+                const theta = Math.random() * Math.PI * 2;
+                const rr = R * 0.6 * Math.random();
+                y = Math.sin(theta) * rr;
+                z = Math.cos(theta) * rr;
+            } else {
+                const u = Math.random();
+                x = (u - 0.42) * L;
+                const rr = Math.random() * R * 0.35;
+                const theta = Math.random() * Math.PI * 2;
+                y = Math.sin(theta) * rr;
+                z = Math.cos(theta) * rr;
+            }
+            out[o] = x; out[o + 1] = y; out[o + 2] = z;
+        }
+        SHAPE_GENERATORS.whistle = whistleShape;
+
         const WORLDS = [
             {
                 key: 'chinese', name: 'Chinese · Gong', scaleName: 'Gong Pentatonic',
@@ -912,10 +954,15 @@
             {
                 key: 'celtic', name: 'Celtic · Dorian', scaleName: 'Dorian',
                 instrumentName: 'Tin Whistle', notesLabel: 'C · D · E♭ · F · G · A · B♭',
-                intervals: [0, 2, 3, 5, 7, 9, 10], synthType: 'pluck',
-                synth: { decay: 1.6, damping: 4200, feedback: 0.988, body: 700, bendChance: 0.12 },
+                intervals: [0, 2, 3, 5, 7, 9, 10], synthType: 'sustain',
+                synth: {
+                    wave1: 'triangle', wave2: 'sine', detuneCents: 5, breath: 0.06,
+                    attack: 0.045, peak: 0.38, filterBase: 900, filterRange: 2400, filterQ: 1.1,
+                    vibratoRate: 5.2, vibratoDepth: 3.5, glide: 0.07, graceChance: 0.35
+                },
+                drone: true,
                 palette: { hue: 0.42, hueSpread: 0.08, satRange: [0.35, 0.7], lightRange: [0.45, 0.75], accentHue: 0.5, accentChance: 0.3 },
-                shapeKey: 'guzheng'
+                shapeKey: 'whistle'
             },
             {
                 key: 'egyptian', name: 'Egyptian · Pentatonic', scaleName: 'Pentatonic',
@@ -961,6 +1008,7 @@
             currentWorldIndex = clamped;
             const world = currentWorld();
             releaseHeldNote();
+            stopDrone();
             applyWorldShape(world);
             if (particles) updatePaletteDesc(world.palette);
             applyWorldUI(world);
@@ -975,10 +1023,28 @@
         let lastPointerX = 0.5, lastPointerT = 0;
         let pluckLastMidi = null;
         let energyKnob = 0.4;
+        let activeSustainVoice = null;
+        let droneVoices = [];
 
         function effectiveEnergy() {
             const velBoost = THREE.MathUtils.clamp(pointerVelocity / 2.5, 0, 1);
             return THREE.MathUtils.clamp(energyKnob * 0.7 + velBoost * 0.3, 0, 1);
+        }
+
+        // ---- Ambient tonic+fifth drone, only for worlds that opt in
+        // (e.g. Tin Whistle). Lazily started on first note, stopped on
+        // world switch. ----
+        function stopDrone() {
+            droneVoices.forEach((v) => v.release(1.4));
+            droneVoices = [];
+        }
+        function startDroneIfNeeded(world) {
+            if (!world.drone || droneVoices.length || !AudioEngine.started) return;
+            const tonicMidi = BASE_MIDI + world.intervals[0];
+            const tonic = midiToFreq(tonicMidi);
+            const fifth = midiToFreq(tonicMidi + 7);
+            const droneCfg = { wave1: 'sine', wave2: 'sine', attack: 1.2, peak: 0.05, filterBase: 300, filterRange: 200, filterQ: 0.6 };
+            droneVoices = [createSustainVoice(tonic, droneCfg), createSustainVoice(fifth, droneCfg)];
         }
 
         function playPluckAt(x, y) {
@@ -989,18 +1055,60 @@
             triggerPluck(midiToFreq(midi), brightnessFromY(y), effectiveEnergy(), world.synth);
         }
 
+        // ---- Sustain-type worlds (breath instruments): one continuous
+        // voice glides between quantised pitches while held, instead of
+        // retriggering per step, so melodies are legato rather than plucked.
+        function startSustainNote(world, x, y) {
+            const midi = quantizePitch(x, world.intervals);
+            pluckLastMidi = midi;
+            const freq = midiToFreq(midi);
+            const energy = effectiveEnergy();
+            const cfg = Object.assign({}, world.synth, { peak: (world.synth.peak || 0.4) * (0.6 + energy * 0.6) });
+            activeSustainVoice = createSustainVoice(freq, cfg);
+            activeSustainVoice.setBrightness(brightnessFromY(y));
+            startDroneIfNeeded(world);
+            onNoteAttack(freq);
+        }
+        function glideSustainNote(world, x, y) {
+            if (!activeSustainVoice) return;
+            const midi = quantizePitch(x, world.intervals);
+            const freq = midiToFreq(midi);
+            const grace = midi !== pluckLastMidi && Math.random() < (world.synth.graceChance || 0);
+            pluckLastMidi = midi;
+            if (grace) {
+                const flick = midiToFreq(midi + (Math.random() < 0.5 ? 2 : -2));
+                activeSustainVoice.setFreq(flick, 0.02);
+                setTimeout(() => activeSustainVoice && activeSustainVoice.setFreq(freq, world.synth.glide || 0.08), 45);
+            } else {
+                activeSustainVoice.setFreq(freq, world.synth.glide || 0.08);
+            }
+            activeSustainVoice.setBrightness(brightnessFromY(y));
+        }
+        function stopSustainNote() {
+            if (activeSustainVoice) {
+                activeSustainVoice.release(0.25);
+                activeSustainVoice = null;
+            }
+        }
+
         function releaseHeldNote() {
             pluckLastMidi = null;
+            stopSustainNote();
         }
 
         function handlePointerDown(x, y) {
             ensureAudioStarted();
             pointerHeld = true;
             pluckLastMidi = null;
-            playPluckAt(x, y);
+            const world = currentWorld();
+            if (world.synthType === 'sustain') startSustainNote(world, x, y);
+            else playPluckAt(x, y);
         }
         function handlePointerMove(x, y) {
-            if (pointerHeld) playPluckAt(x, y);
+            if (!pointerHeld) return;
+            const world = currentWorld();
+            if (world.synthType === 'sustain') glideSustainNote(world, x, y);
+            else playPluckAt(x, y);
         }
         function handlePointerUp() {
             pointerHeld = false;
