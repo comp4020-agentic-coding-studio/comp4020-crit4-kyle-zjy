@@ -50,6 +50,21 @@
             text-transform: uppercase;
         }
 
+        #debug-note {
+            position: absolute;
+            bottom: 15px;
+            left: 15px;
+            padding: 4px 10px;
+            font-size: 9px;
+            letter-spacing: 0.08em;
+            font-family: 'JetBrains Mono', monospace;
+            background: rgba(0,0,0,0.55);
+            color: rgba(255,255,255,0.6);
+            border-radius: 6px;
+            z-index: 11;
+            pointer-events: none;
+        }
+
         .panel {
             background: rgba(10, 10, 10, 0.5);
             backdrop-filter: blur(15px);
@@ -348,13 +363,20 @@
         <video id="input_video" class="w-full h-full object-cover"></video>
     </div>
     <div id="hand-badge" class="text-red-400">Hand Control Offline</div>
+    <div id="debug-note">— · — / MIDI — / — Hz</div>
 
     <div id="enter-overlay">
         <h2>Enter the Deck</h2>
         <p>Click or touch to initialise sound</p>
     </div>
 
-    <script>
+    <script type="module">
+        import {
+            BASE_MIDI, SCALES,
+            midiToFreq, midiToName,
+            createNoteResolver,
+        } from './src/scale.ts';
+
         let scene, camera, renderer, starfield, particles;
         let ringGroups = new THREE.Group();
 
@@ -664,7 +686,7 @@
         // engine.reverbSend / engine.delaySend.
         // =====================================================================
         const AudioEngine = {
-            ctx: null, masterGain: null, compressor: null, analyser: null,
+            ctx: null, masterGain: null, compressor: null, limiter: null, analyser: null,
             dry: null, reverb: null, reverbSend: null,
             delay: null, delayFeedback: null, delaySend: null,
             started: false, freqData: null,
@@ -676,17 +698,28 @@
                 this.ctx = new Ctx();
 
                 this.masterGain = this.ctx.createGain();
-                this.masterGain.gain.value = 0.85;
+                this.masterGain.gain.value = 0.7;
                 this.compressor = this.ctx.createDynamicsCompressor();
-                this.compressor.threshold.value = -18;
+                this.compressor.threshold.value = -20;
                 this.compressor.ratio.value = 4;
+                // Safety limiter: a second, harder compressor stage so that
+                // several voices ringing at once (pointer sweeping across
+                // scale zones) gets tamed instead of turning into clipped,
+                // buzzy overlap — see item 11 in the audio-quality pass.
+                this.limiter = this.ctx.createDynamicsCompressor();
+                this.limiter.threshold.value = -6;
+                this.limiter.knee.value = 0;
+                this.limiter.ratio.value = 20;
+                this.limiter.attack.value = 0.001;
+                this.limiter.release.value = 0.1;
                 this.analyser = this.ctx.createAnalyser();
                 this.analyser.fftSize = 512;
                 this.analyser.smoothingTimeConstant = 0.75;
                 this.freqData = new Uint8Array(this.analyser.frequencyBinCount);
 
                 this.masterGain.connect(this.compressor);
-                this.compressor.connect(this.analyser);
+                this.compressor.connect(this.limiter);
+                this.limiter.connect(this.analyser);
                 this.analyser.connect(this.ctx.destination);
 
                 this.dry = this.ctx.createGain();
@@ -696,7 +729,7 @@
                 this.reverb = this.ctx.createConvolver();
                 this.reverb.buffer = this._impulse(2.6, 2.4);
                 this.reverbSend = this.ctx.createGain();
-                this.reverbSend.gain.value = 0.3;
+                this.reverbSend.gain.value = 0.22;
                 this.reverbSend.connect(this.reverb);
                 this.reverb.connect(this.masterGain);
 
@@ -750,21 +783,10 @@
             AudioEngine.resume();
         }
 
-        // ---- Scale quantisation: the same normalised X always lands on the
-        // *current world's* scale, several octaves wide. This one function is
-        // the heart of "same gesture, different musical language". ----
-        const BASE_MIDI = 48; // C3
-        const OCTAVE_SPAN = 3;
-
-        function quantizePitch(x01, intervals) {
-            const clamped = THREE.MathUtils.clamp(x01, 0, 1);
-            const span = intervals.length * OCTAVE_SPAN;
-            const idx = Math.min(span - 1, Math.floor(clamped * span));
-            const octave = Math.floor(idx / intervals.length);
-            const degree = intervals[idx % intervals.length];
-            return BASE_MIDI + octave * 12 + degree;
-        }
-        function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+        // ---- Scale quantisation lives in src/scale.ts (imported above) so
+        // it's unit-testable without an AudioContext: pointer X always lands
+        // on a discrete zone in the *current world's* scale, never a glide
+        // between two notes. ----
         function brightnessFromY(y01) { return 1 - THREE.MathUtils.clamp(y01, 0, 1); }
 
         // ---- Shared synthesis helpers ----
@@ -794,54 +816,92 @@
         // ---- Plucked-string voice (Karplus-Strong): a short noise burst
         // excites a delay-line feedback loop tuned to the note's period, damped
         // by a lowpass in the loop. Guzheng and Koto both use this with
-        // different decay/damping/body-resonance parameters, which is what
-        // makes two "plucked string" worlds sound distinct rather than
+        // different decay/damping/body-resonance/reverb parameters, which is
+        // what makes two "plucked string" worlds sound distinct rather than
         // recoloured copies of each other. ----
+        const MAX_PLUCK_VOICES = 5;
+        let activePluckVoices = [];
+
+        // Force-fade-and-disconnect a still-ringing voice immediately,
+        // instead of letting it ring to its natural decay — this is what
+        // stops fast pointer sweeps from stacking a growing pile of
+        // near-unity-feedback loops into a wall of buzz.
+        function chokePluckVoice(voice) {
+            try {
+                const t = AudioEngine.ctx.currentTime;
+                voice.outGain.gain.cancelScheduledValues(t);
+                voice.outGain.gain.setTargetAtTime(0.0001, t, 0.008);
+                setTimeout(() => voice.disconnectAll(), 60);
+            } catch (e) {}
+        }
+
         function triggerPluck(freq, brightness, energy, cfg) {
             const ctx = AudioEngine.ctx;
             const now = ctx.currentTime;
-            const c = Object.assign({ decay: 2.0, damping: 4000, feedback: 0.99, body: 900, bendChance: 0.15 }, cfg);
+            const c = Object.assign(
+                { decay: 2.0, damping: 4000, feedback: 0.985, body: 900, bendChance: 0.15, reverbSend: 0.25 },
+                cfg,
+            );
+
+            while (activePluckVoices.length >= MAX_PLUCK_VOICES) {
+                chokePluckVoice(activePluckVoices.shift());
+            }
 
             const burst = ctx.createBufferSource();
             burst.buffer = makeNoiseBuffer(ctx, 0.008);
 
+            // Broadband noise shaped only by a lowpass (not a narrow
+            // bandpass around the fundamental) so the excitation keeps its
+            // transient click — a bandpass-limited excitation is what made
+            // this read as an electronic tone instead of a pluck.
             const exciteFilter = ctx.createBiquadFilter();
-            exciteFilter.type = 'bandpass';
-            exciteFilter.frequency.value = freq;
-            exciteFilter.Q.value = 1.5;
+            exciteFilter.type = 'lowpass';
+            exciteFilter.frequency.value = 5200 + brightness * 1300;
+            exciteFilter.Q.value = 0.4;
 
             const delay = ctx.createDelay(0.05);
             delay.delayTime.value = 1 / freq;
 
             const damping = ctx.createBiquadFilter();
             damping.type = 'lowpass';
-            damping.frequency.value = c.damping * (0.6 + brightness * 0.8);
+            damping.frequency.value = Math.min(7000, c.damping * (0.55 + brightness * 0.55));
 
             const feedbackGain = ctx.createGain();
             feedbackGain.gain.value = c.feedback;
 
+            // Removes DC/rumble the feedback loop can otherwise accumulate
+            // over many cycles.
+            const loopHighpass = ctx.createBiquadFilter();
+            loopHighpass.type = 'highpass';
+            loopHighpass.frequency.value = 70;
+
             const bodyFilter = ctx.createBiquadFilter();
             bodyFilter.type = 'peaking';
             bodyFilter.frequency.value = c.body;
-            bodyFilter.gain.value = 4;
+            bodyFilter.gain.value = 3;
             bodyFilter.Q.value = 0.8;
 
             const outGain = ctx.createGain();
             outGain.gain.setValueAtTime(0.0001, now);
-            outGain.gain.linearRampToValueAtTime(0.5 + energy * 0.3, now + 0.003);
+            outGain.gain.linearRampToValueAtTime(0.45 + energy * 0.25, now + 0.003);
             const sustainTime = c.decay * (0.5 + energy * 0.9);
             outGain.gain.setTargetAtTime(0.0001, now + 0.02, sustainTime / 4);
 
+            const reverbAmount = ctx.createGain();
+            reverbAmount.gain.value = c.reverbSend;
+
             burst.connect(exciteFilter);
             exciteFilter.connect(delay);
-            delay.connect(damping);
+            delay.connect(loopHighpass);
+            loopHighpass.connect(damping);
             damping.connect(feedbackGain);
             feedbackGain.connect(delay);
             damping.connect(bodyFilter);
             bodyFilter.connect(outGain);
 
             outGain.connect(AudioEngine.dry);
-            outGain.connect(AudioEngine.reverbSend);
+            outGain.connect(reverbAmount);
+            reverbAmount.connect(AudioEngine.reverbSend);
 
             burst.start(now);
             burst.stop(now + 0.01);
@@ -852,15 +912,21 @@
                 delay.delayTime.linearRampToValueAtTime(1 / (freq * bendFactor), now + 0.19);
             }
 
-            const stopAt = now + sustainTime + 0.3;
-            setTimeout(() => {
-                try {
-                    delay.disconnect(); feedbackGain.disconnect(); damping.disconnect();
-                    bodyFilter.disconnect(); outGain.disconnect(); exciteFilter.disconnect();
-                } catch (e) {}
-            }, (stopAt - now) * 1000 + 100);
+            const voice = {
+                outGain,
+                disconnectAll() {
+                    try {
+                        delay.disconnect(); feedbackGain.disconnect(); damping.disconnect();
+                        loopHighpass.disconnect(); bodyFilter.disconnect(); outGain.disconnect();
+                        exciteFilter.disconnect(); reverbAmount.disconnect();
+                    } catch (e) {}
+                    activePluckVoices = activePluckVoices.filter((v) => v !== voice);
+                },
+            };
+            activePluckVoices.push(voice);
 
-            onNoteAttack(freq);
+            const stopAt = now + sustainTime + 0.3;
+            setTimeout(voice.disconnectAll, (stopAt - now) * 1000 + 100);
         }
 
         // ---- Continuous "breath/reed" voice: two oscillators (for reed beat
@@ -967,8 +1033,16 @@
         }
 
         let noteAttackPulse = 0;
-        function onNoteAttack(freq) {
+        const debugNoteEl = document.getElementById('debug-note');
+        // Temporary debug readout (item 14 of the audio-correction pass): one
+        // line per genuine discrete note-attack, so a slow drag's staircase
+        // of notes is visible as well as audible. Not part of final polish.
+        function onNoteAttack(midi, world) {
             noteAttackPulse = 1.0;
+            if (debugNoteEl && world) {
+                const freq = midiToFreq(midi);
+                debugNoteEl.textContent = `${world.name} / ${midiToName(midi)} / MIDI ${midi} / ${freq.toFixed(2)} Hz`;
+            }
         }
 
         // =====================================================================
@@ -1159,27 +1233,27 @@
             {
                 key: 'chinese', name: 'Chinese · Gong', scaleName: 'Gong Pentatonic',
                 instrumentName: 'Guzheng', notesLabel: 'C · D · E · G · A',
-                intervals: [0, 2, 4, 7, 9], synthType: 'pluck',
-                synth: { decay: 2.4, damping: 3600, feedback: 0.992, body: 850, bendChance: 0.18 },
+                intervals: SCALES.chineseGong, synthType: 'pluck',
+                synth: { decay: 2.4, damping: 3600, feedback: 0.988, body: 850, bendChance: 0.18, reverbSend: 0.32 },
                 palette: { hue: 0.02, hueSpread: 0.05, satRange: [0.6, 0.9], lightRange: [0.45, 0.65], accentHue: 0.12, accentChance: 0.25 },
                 shapeKey: 'guzheng'
             },
             {
                 key: 'japanese', name: 'Japanese · In Sen', scaleName: 'In Sen',
                 instrumentName: 'Koto', notesLabel: 'C · D♭ · F · G · B♭',
-                intervals: [0, 1, 5, 7, 10], synthType: 'pluck',
-                synth: { decay: 1.1, damping: 6200, feedback: 0.982, body: 1400, bendChance: 0.06 },
+                intervals: SCALES.japaneseInSen, synthType: 'pluck',
+                synth: { decay: 0.9, damping: 6200, feedback: 0.975, body: 1400, bendChance: 0.04, reverbSend: 0.1 },
                 palette: { hue: 0.97, hueSpread: 0.04, satRange: [0.1, 0.35], lightRange: [0.55, 0.85], accentHue: 0.98, accentChance: 0.15 },
                 shapeKey: 'koto'
             },
             {
                 key: 'celtic', name: 'Celtic · Dorian', scaleName: 'Dorian',
                 instrumentName: 'Tin Whistle', notesLabel: 'C · D · E♭ · F · G · A · B♭',
-                intervals: [0, 2, 3, 5, 7, 9, 10], synthType: 'sustain',
+                intervals: SCALES.celticDorian, synthType: 'sustain',
                 synth: {
                     wave1: 'triangle', wave2: 'sine', detuneCents: 5, breath: 0.06,
-                    attack: 0.045, peak: 0.38, filterBase: 900, filterRange: 2400, filterQ: 1.1,
-                    vibratoRate: 5.2, vibratoDepth: 3.5, glide: 0.07, graceChance: 0.35
+                    attack: 0.03, peak: 0.38, filterBase: 900, filterRange: 2400, filterQ: 1.1,
+                    vibratoRate: 5.2, vibratoDepth: 3.5, crossfadeMs: 30, graceChance: 0.12
                 },
                 drone: true,
                 palette: { hue: 0.42, hueSpread: 0.08, satRange: [0.35, 0.7], lightRange: [0.45, 0.75], accentHue: 0.5, accentChance: 0.3 },
@@ -1188,12 +1262,12 @@
             {
                 key: 'egyptian', name: 'Egyptian · Pentatonic', scaleName: 'Pentatonic',
                 instrumentName: 'Ney', notesLabel: 'C · D · F · G · B♭',
-                intervals: [0, 2, 5, 7, 10], synthType: 'sustain',
+                intervals: SCALES.egyptianPentatonic, synthType: 'sustain',
                 synth: {
                     wave1: 'sine', wave2: 'triangle', detuneCents: 6, breath: 0.11,
                     attack: 0.16, peak: 0.34, filterBase: 500, filterRange: 3200, filterQ: 0.7,
-                    vibratoRate: 0.6, vibratoDepth: 2.5, glide: 0.14, graceChance: 0.05,
-                    reverbSend: 0.35
+                    vibratoRate: 0.6, vibratoDepth: 2.5, crossfadeMs: 80, graceChance: 0,
+                    postAttackBendCents: 20, reverbSend: 0.35
                 },
                 palette: { hue: 0.09, hueSpread: 0.05, satRange: [0.4, 0.75], lightRange: [0.4, 0.65], accentHue: 0.6, accentChance: 0.12 },
                 shapeKey: 'ney'
@@ -1201,14 +1275,13 @@
             {
                 key: 'blues', name: 'Blues · Minor Blues', scaleName: 'Minor Blues',
                 instrumentName: 'Blues Harmonica', notesLabel: 'C · E♭ · F · G♭ · G · B♭',
-                intervals: [0, 3, 5, 6, 7, 10], synthType: 'sustain',
+                intervals: SCALES.bluesMinor, synthType: 'sustain',
                 synth: {
                     wave1: 'sawtooth', wave2: 'square', detuneCents: 11, breath: 0.03,
-                    attack: 0.03, peak: 0.32, filterBase: 700, filterRange: 2000, filterQ: 2.2,
-                    vibratoRate: 5.8, vibratoDepth: 6, glide: 0.05, graceChance: 0,
-                    distortion: 0.22, bendOnAttack: true, bendSemitones: 1.4
+                    attack: 0.02, peak: 0.32, filterBase: 700, filterRange: 2000, filterQ: 1.6,
+                    vibratoRate: 5.8, vibratoDepth: 6, crossfadeMs: 25, graceChance: 0,
+                    distortion: 0.16
                 },
-                blueNoteDegree: 4, blueNoteTarget: 3,
                 palette: { hue: 0.62, hueSpread: 0.07, satRange: [0.55, 0.85], lightRange: [0.4, 0.65], accentHue: 0.1, accentChance: 0.15 },
                 shapeKey: 'harmonica'
             }
@@ -1269,24 +1342,16 @@
             return THREE.MathUtils.clamp(energyKnob * 0.7 + velBoost * 0.3, 0, 1);
         }
 
-        // ---- Scale quantisation with an optional "blue note" substitution:
-        // worlds like Blues can flag one scale degree (the natural 5th) to
-        // occasionally resolve to another (the flat 5th) instead, with the
-        // odds rising as ENERGY/gesture speed rises — a faster, more
-        // aggressive gesture reaches for the blue note more often. ----
-        function quantizeForWorld(world, x01) {
-            const intervals = world.intervals;
-            const clamped = THREE.MathUtils.clamp(x01, 0, 1);
-            const span = intervals.length * OCTAVE_SPAN;
-            const idx = Math.min(span - 1, Math.floor(clamped * span));
-            const octave = Math.floor(idx / intervals.length);
-            let degreeIndex = idx % intervals.length;
-            if (world.blueNoteDegree != null && degreeIndex === world.blueNoteDegree) {
-                const chance = 0.15 + effectiveEnergy() * 0.55;
-                if (Math.random() < chance) degreeIndex = world.blueNoteTarget;
-            }
-            return BASE_MIDI + octave * 12 + intervals[degreeIndex];
-        }
+        // ---- One stateful note resolver per world (see src/scale.ts):
+        // pointer X always lands on a discrete zone in that world's scale,
+        // with hysteresis around zone boundaries and a retrigger floor so
+        // jitter can't machine-gun notes. Reset on every fresh press/pinch
+        // so releasing and re-landing on the same zone still re-attacks. ----
+        const noteResolvers = {};
+        WORLDS.forEach((w) => {
+            noteResolvers[w.key] = createNoteResolver({ intervals: w.intervals, deadZone: 0.15, retriggerMs: 45 });
+        });
+        function currentResolver() { return noteResolvers[currentWorld().key]; }
 
         // ---- Ambient tonic+fifth drone, only for worlds that opt in
         // (e.g. Tin Whistle). Lazily started on first note, stopped on
@@ -1306,49 +1371,74 @@
 
         function playPluckAt(x, y) {
             const world = currentWorld();
-            const midi = quantizeForWorld(world, x);
-            if (midi === pluckLastMidi) return;
+            const { midi, changed } = currentResolver().resolve(x, performance.now());
+            if (!changed) return;
             pluckLastMidi = midi;
             triggerPluck(midiToFreq(midi), brightnessFromY(y), effectiveEnergy(), world.synth);
+            onNoteAttack(midi, world);
         }
 
-        // ---- Sustain-type worlds (breath instruments): one continuous
-        // voice glides between quantised pitches while held, instead of
-        // retriggering per step, so melodies are legato rather than plucked.
-        function startSustainNote(world, x, y) {
-            const midi = quantizeForWorld(world, x);
-            pluckLastMidi = midi;
+        // ---- Sustain-type worlds (breath instruments): every genuine scale
+        // -zone change starts a *new* voice and releases the previous one on
+        // a short overlap (voice-crossfade), instead of retuning one live
+        // oscillator — that's what turns the old theremin glide into a
+        // legato sequence of discrete notes. ----
+        function spawnSustainVoice(world, midi, y, isTransition) {
             const freq = midiToFreq(midi);
             const energy = effectiveEnergy();
             const cfg = Object.assign({}, world.synth, { peak: (world.synth.peak || 0.4) * (0.6 + energy * 0.6) });
-            let startFreq = freq;
-            if (world.synth.bendOnAttack) {
-                startFreq = freq * Math.pow(2, -(world.synth.bendSemitones || 1) / 12);
+            const prevVoice = activeSustainVoice;
+
+            // Whistle-style grace note: a short, quiet *separate* voice just
+            // before the real attack, gated to energetic gestures and low
+            // odds so it's an occasional ornament, not a glide on every note.
+            const graceChance = world.synth.graceChance || 0;
+            const doGrace = isTransition && energy > 0.45 && Math.random() < graceChance;
+            const spawnDelayMs = doGrace ? 55 : 0;
+
+            if (doGrace) {
+                const graceMidi = midi + (Math.random() < 0.5 ? 2 : -2);
+                const graceVoice = createSustainVoice(midiToFreq(graceMidi), Object.assign({}, cfg, { peak: cfg.peak * 0.45, attack: 0.008 }));
+                graceVoice.setBrightness(brightnessFromY(y));
+                setTimeout(() => graceVoice.release(0.05), 45);
             }
-            activeSustainVoice = createSustainVoice(startFreq, cfg);
-            activeSustainVoice.setBrightness(brightnessFromY(y));
-            if (world.synth.bendOnAttack) {
-                const resolveTime = 0.28 - energy * 0.18;
-                const voice = activeSustainVoice;
-                setTimeout(() => { if (activeSustainVoice === voice) voice.setFreq(freq, resolveTime); }, 10);
-            }
+
+            setTimeout(() => {
+                const voice = createSustainVoice(freq, cfg);
+                voice.setBrightness(brightnessFromY(y));
+                activeSustainVoice = voice;
+
+                // Ney-style small bounded post-attack bend: settles back onto
+                // the target quickly, so it colours the attack without ever
+                // obscuring which scale degree this is.
+                if (world.synth.postAttackBendCents) {
+                    const cents = world.synth.postAttackBendCents;
+                    voice.setFreq(freq * Math.pow(2, -cents / 1200), 0.001);
+                    setTimeout(() => { if (activeSustainVoice === voice) voice.setFreq(freq, 0.15); }, 15);
+                }
+
+                if (prevVoice) prevVoice.release((world.synth.crossfadeMs || 40) / 1000);
+            }, spawnDelayMs);
+        }
+
+        function startSustainNote(world, x, y) {
+            currentResolver().reset();
+            const { midi } = currentResolver().resolve(x, performance.now());
+            pluckLastMidi = midi;
+            spawnSustainVoice(world, midi, y, false);
             startDroneIfNeeded(world);
-            onNoteAttack(freq);
+            onNoteAttack(midi, world);
         }
         function glideSustainNote(world, x, y) {
             if (!activeSustainVoice) return;
-            const midi = quantizeForWorld(world, x);
-            const freq = midiToFreq(midi);
-            const grace = midi !== pluckLastMidi && Math.random() < (world.synth.graceChance || 0);
-            pluckLastMidi = midi;
-            if (grace) {
-                const flick = midiToFreq(midi + (Math.random() < 0.5 ? 2 : -2));
-                activeSustainVoice.setFreq(flick, 0.02);
-                setTimeout(() => activeSustainVoice && activeSustainVoice.setFreq(freq, world.synth.glide || 0.08), 45);
+            const { midi, changed } = currentResolver().resolve(x, performance.now());
+            if (changed) {
+                pluckLastMidi = midi;
+                spawnSustainVoice(world, midi, y, true);
+                onNoteAttack(midi, world);
             } else {
-                activeSustainVoice.setFreq(freq, world.synth.glide || 0.08);
+                activeSustainVoice.setBrightness(brightnessFromY(y));
             }
-            activeSustainVoice.setBrightness(brightnessFromY(y));
         }
         function stopSustainNote() {
             if (activeSustainVoice) {
@@ -1359,6 +1449,7 @@
 
         function releaseHeldNote() {
             pluckLastMidi = null;
+            currentResolver().reset();
             stopSustainNote();
         }
 
