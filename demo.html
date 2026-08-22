@@ -544,7 +544,13 @@
                 const x = e.clientX / window.innerWidth, y = e.clientY / window.innerHeight;
                 const t = performance.now();
                 const dt = Math.max(1, t - lastPointerT);
-                pointerVelocity = Math.abs(x - lastPointerX) / (dt / 1000);
+                const dx = x - lastPointerX;
+                pointerVelocity = Math.abs(dx) / (dt / 1000);
+                const dir = dx > 0.0015 ? 1 : (dx < -0.0015 ? -1 : 0);
+                if (dir !== 0 && lastPointerDir !== 0 && dir !== lastPointerDir && pointerVelocity > SCRATCH_VELOCITY_THRESHOLD) {
+                    maybeTriggerScratch(dir, pointerVelocity);
+                }
+                if (dir !== 0) lastPointerDir = dir;
                 lastPointerX = x; lastPointerT = t;
                 pointerX = x; pointerY = y;
                 handlePointerMove(x, y);
@@ -1211,10 +1217,14 @@
         let pointerX = 0.5, pointerY = 0.5;
         let pointerVelocity = 0;
         let lastPointerX = 0.5, lastPointerT = 0;
+        let lastPointerDir = 0;
         let pluckLastMidi = null;
         let energyKnob = 0.4;
         let activeSustainVoice = null;
         let droneVoices = [];
+        let scratchSpin = 0;
+        let lastScratchTime = 0;
+        const SCRATCH_VELOCITY_THRESHOLD = 1.6;
 
         function effectiveEnergy() {
             const velBoost = THREE.MathUtils.clamp(pointerVelocity / 2.5, 0, 1);
@@ -1333,6 +1343,72 @@
             releaseHeldNote();
         }
 
+        // ---- Scratch gesture: a fast left-right reversal — mouse or hand,
+        // identical trigger and identical musical result either way — fires
+        // a short pitch-bend/filter-sweep/delay burst plus a rotation kick,
+        // instead of a literal vinyl sample. ----
+        function maybeTriggerScratch(dir, velocity) {
+            const now = performance.now();
+            if (now - lastScratchTime < 220) return;
+            lastScratchTime = now;
+            const intensity = THREE.MathUtils.clamp((velocity - SCRATCH_VELOCITY_THRESHOLD) / 3, 0, 1);
+            scratchBurst(dir, intensity);
+        }
+
+        function scratchBurst(dir, intensity) {
+            ensureAudioStarted();
+            const ctx = AudioEngine.ctx;
+            const now = ctx.currentTime;
+
+            const noise = ctx.createBufferSource();
+            noise.buffer = makeNoiseBuffer(ctx, 0.24);
+
+            const filter = ctx.createBiquadFilter();
+            filter.type = 'bandpass';
+            filter.Q.value = 6;
+            const startFreq = dir > 0 ? 280 : 3200;
+            const endFreq = dir > 0 ? 3200 : 280;
+            filter.frequency.setValueAtTime(startFreq, now);
+            filter.frequency.exponentialRampToValueAtTime(endFreq, now + 0.16);
+
+            const shaper = ctx.createWaveShaper();
+            shaper.curve = makeDistortionCurve(0.55 + intensity * 0.4);
+
+            const burstGain = ctx.createGain();
+            burstGain.gain.setValueAtTime(0.0001, now);
+            burstGain.gain.linearRampToValueAtTime(0.22 + intensity * 0.25, now + 0.015);
+            burstGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+
+            noise.connect(filter);
+            filter.connect(shaper);
+            shaper.connect(burstGain);
+            burstGain.connect(AudioEngine.dry);
+
+            const delayBoost = ctx.createGain();
+            delayBoost.gain.value = 0.6;
+            burstGain.connect(delayBoost);
+            delayBoost.connect(AudioEngine.delaySend);
+            const prevDelaySend = AudioEngine.delaySend.gain.value;
+            AudioEngine.delaySend.gain.setTargetAtTime(0.4, now, 0.015);
+            AudioEngine.delaySend.gain.setTargetAtTime(prevDelaySend, now + 0.28, 0.18);
+
+            noise.start(now);
+            noise.stop(now + 0.24);
+            setTimeout(() => {
+                try { filter.disconnect(); shaper.disconnect(); burstGain.disconnect(); delayBoost.disconnect(); } catch (e) {}
+            }, 500);
+
+            if (activeSustainVoice && pluckLastMidi != null) {
+                const baseFreq = midiToFreq(pluckLastMidi);
+                activeSustainVoice.setFreq(baseFreq * (dir > 0 ? 1.16 : 0.86), 0.015);
+                const voice = activeSustainVoice;
+                setTimeout(() => { if (activeSustainVoice === voice) voice.setFreq(baseFreq, 0.12); }, 90);
+            }
+
+            scratchSpin = dir * (0.15 + intensity * 0.3);
+            noteAttackPulse = Math.max(noteAttackPulse, 0.6);
+        }
+
         let ringLayerMeshes = [];
         function createEpicRings() {
             ringGroups.clear();
@@ -1397,6 +1473,7 @@
         // instrument, not a decoration. X is mirrored to match the mirrored
         // preview (move your hand right -> pitch goes up, as seen on screen).
         let handPinched = false;
+        let lastHandX = 0.5, lastHandT = 0, lastHandDir = 0;
 
         function handleHands(res) {
             if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
@@ -1408,6 +1485,19 @@
 
                 targetRotY = (handX - 0.5) * 0.02;
                 targetRotX = (handY - 0.5) * 0.01;
+
+                // Same scratch trigger as the mouse: a fast horizontal
+                // direction reversal, so the gesture isn't hand-only.
+                const handNow = performance.now();
+                const handDt = Math.max(1, handNow - lastHandT);
+                const handDx = handX - lastHandX;
+                const handVelocity = Math.abs(handDx) / (handDt / 1000);
+                const handDir = handDx > 0.004 ? 1 : (handDx < -0.004 ? -1 : 0);
+                if (handDir !== 0 && lastHandDir !== 0 && handDir !== lastHandDir && handVelocity > SCRATCH_VELOCITY_THRESHOLD) {
+                    maybeTriggerScratch(handDir, handVelocity);
+                }
+                if (handDir !== 0) lastHandDir = handDir;
+                lastHandX = handX; lastHandT = handNow;
 
                 // Openness: average fingertip-to-wrist spread across the four
                 // fingers. Open hand -> more space/reverb/dispersion; closed
@@ -1465,10 +1555,11 @@
             currentRotY += (targetRotY - currentRotY) * 0.05;
 
             particles.rotation.x += currentRotX;
-            particles.rotation.y += currentRotY;
+            particles.rotation.y += currentRotY + scratchSpin * 0.4;
             const idleSpin = 0.0016 + energyKnob * 0.003;
             ringGroups.rotation.x += currentRotX * 0.8;
-            ringGroups.rotation.y += currentRotY * 0.8 + idleSpin;
+            ringGroups.rotation.y += currentRotY * 0.8 + idleSpin + scratchSpin;
+            scratchSpin *= 0.88;
 
             // Low-frequency energy -> the instrument "breathes"; a note
             // attack adds a brief shockwave pulse on top.
