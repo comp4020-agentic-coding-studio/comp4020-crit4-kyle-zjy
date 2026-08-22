@@ -1,9 +1,16 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en-AU">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>粒子星际交互系统_jinlin</title>
+    <title>World Deck — a five-world musical instrument</title>
+    <meta
+      name="description"
+      content="World Deck: an audiovisual instrument that crossfades five musical traditions — Guzheng, Koto, Tin Whistle, Ney, and Harmonica — played with a mouse, touch, or a bare hand over the webcam."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="./card.png" />
+    <meta name="twitter:card" content="summary_large_image" />
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
@@ -11,63 +18,340 @@
     <style>
         body { margin: 0; overflow: hidden; background-color: #000; color: white; font-family: 'Inter', sans-serif; }
         canvas { display: block; }
+
         #video-container {
             position: absolute;
             bottom: 15px;
             right: 15px;
             width: 160px;
             height: 120px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.12);
             border-radius: 12px;
             overflow: hidden;
             transform: scaleX(-1);
             background: #000;
             z-index: 10;
         }
+        #hand-badge {
+            position: absolute;
+            bottom: 15px;
+            right: 15px;
+            width: 160px;
+            padding: 3px 0;
+            text-align: center;
+            font-size: 8px;
+            letter-spacing: 0.15em;
+            font-family: 'JetBrains Mono', monospace;
+            background: rgba(0,0,0,0.55);
+            z-index: 11;
+            border-bottom-left-radius: 12px;
+            border-bottom-right-radius: 12px;
+            pointer-events: none;
+            text-transform: uppercase;
+        }
+
         .panel {
             background: rgba(10, 10, 10, 0.5);
             backdrop-filter: blur(15px);
             border: 1px solid rgba(255, 255, 255, 0.05);
             pointer-events: auto;
         }
+
+        .site-nav {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            display: flex;
+            justify-content: center;
+            padding: 6px 0;
+            z-index: 30;
+            pointer-events: none;
+        }
+        .site-nav a {
+            pointer-events: auto;
+            font-size: 9px;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: rgba(255,255,255,0.35);
+            text-decoration: none;
+            font-family: 'JetBrains Mono', monospace;
+            transition: color 0.2s;
+        }
+        .site-nav a:hover { color: rgba(255,255,255,0.8); }
+
+        /* Central floating typography above the instrument */
+        #center-label {
+            position: absolute;
+            top: 14%;
+            left: 50%;
+            transform: translateX(-50%);
+            text-align: center;
+            z-index: 5;
+            pointer-events: none;
+            transition: opacity 0.4s ease;
+        }
+        #center-label .world-name {
+            font-size: clamp(1.1rem, 2.4vw, 1.8rem);
+            font-weight: 900;
+            font-style: italic;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+        #center-label .world-scale-name {
+            font-size: 9px;
+            letter-spacing: 0.3em;
+            text-transform: uppercase;
+            color: rgba(255,255,255,0.5);
+            margin-top: 2px;
+        }
+        #center-label .instrument-name {
+            margin-top: 10px;
+            font-size: 11px;
+            letter-spacing: 0.35em;
+            text-transform: uppercase;
+            font-weight: 700;
+        }
+        #center-label .scale-notes {
+            margin-top: 6px;
+            font-size: 10px;
+            letter-spacing: 0.3em;
+            color: rgba(255,255,255,0.55);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* WORLD crossfader */
+        #world-deck {
+            position: absolute;
+            bottom: 26px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 20;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+            width: min(640px, 86vw);
+        }
+        #world-fader-track {
+            position: relative;
+            width: 100%;
+            height: 34px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.08);
+            cursor: pointer;
+            touch-action: none;
+        }
+        #world-fader-line {
+            position: absolute;
+            left: 5%;
+            right: 5%;
+            top: 50%;
+            height: 1px;
+            background: rgba(255,255,255,0.15);
+            transform: translateY(-50%);
+        }
+        .world-tick {
+            position: absolute;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 8px;
+            letter-spacing: 0.12em;
+            color: rgba(255,255,255,0.35);
+            white-space: nowrap;
+            pointer-events: none;
+            transition: color 0.25s, text-shadow 0.25s;
+        }
+        .world-tick.active {
+            color: #fff;
+            text-shadow: 0 0 8px currentColor;
+        }
+        #world-fader-head {
+            position: absolute;
+            top: 50%;
+            width: 22px;
+            height: 22px;
+            border-radius: 999px;
+            background: radial-gradient(circle at 35% 30%, #fff, #00f2ff 70%);
+            box-shadow: 0 0 18px 2px currentColor;
+            transform: translate(-50%, -50%);
+            transition: box-shadow 0.2s;
+        }
+        #world-fader-label {
+            font-size: 8px;
+            letter-spacing: 0.35em;
+            color: rgba(255,255,255,0.4);
+            text-transform: uppercase;
+        }
+
+        /* ENERGY control inside the panel */
+        #energy-control {
+            position: relative;
+            width: 100%;
+            height: 10px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.06);
+            cursor: pointer;
+            touch-action: none;
+        }
+        #energy-fill {
+            position: absolute;
+            inset: 0;
+            width: 40%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #00f2ff, #ff2e88);
+        }
+        #energy-knob {
+            position: absolute;
+            top: 50%;
+            left: 40%;
+            width: 16px;
+            height: 16px;
+            border-radius: 999px;
+            background: #fff;
+            box-shadow: 0 0 8px rgba(255,255,255,0.7);
+            transform: translate(-50%, -50%);
+        }
+
+        .status-dot {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 999px;
+            margin-right: 4px;
+        }
+
+        #enter-overlay {
+            position: absolute;
+            inset: 0;
+            z-index: 50;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: radial-gradient(ellipse at center, rgba(10,10,20,0.7), rgba(0,0,0,0.95));
+            cursor: pointer;
+            transition: opacity 0.7s ease;
+        }
+        #enter-overlay.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+        #enter-overlay h2 {
+            font-size: clamp(1.6rem, 5vw, 3rem);
+            font-weight: 900;
+            font-style: italic;
+            letter-spacing: 0.08em;
+            background: linear-gradient(90deg, #00f2ff, #ff2e88);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            margin: 0;
+        }
+        #enter-overlay p {
+            margin-top: 10px;
+            font-size: 11px;
+            letter-spacing: 0.25em;
+            text-transform: uppercase;
+            color: rgba(255,255,255,0.5);
+        }
+
+        @media (max-width: 640px) {
+            #video-container, #hand-badge { display: none; }
+        }
     </style>
 </head>
 <body>
 
+    <nav class="site-nav" aria-label="Primary">
+        <a href="./">Home</a>
+    </nav>
+
     <div id="ui-layer" class="absolute top-4 left-4 pointer-events-none z-20">
-        <div class="panel w-60 p-4 rounded-2xl space-y-4 shadow-2xl">
+        <div class="panel w-64 p-4 rounded-2xl space-y-3 shadow-2xl">
             <h1 class="text-base font-black italic tracking-tighter bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-emerald-500">
-                ASTRO SPHERE V6
+                WORLD DECK
             </h1>
-            
+
             <div class="space-y-1">
-                <label class="text-[8px] text-gray-400 uppercase font-bold tracking-widest">核心色彩 (衍生多色)</label>
-                <input type="color" id="colorPicker" value="#00f2ff" class="w-full h-7 rounded-lg cursor-pointer bg-transparent border-none">
+                <label class="text-[8px] text-gray-400 uppercase font-bold tracking-widest">Active World</label>
+                <div id="panel-world" class="text-xs font-bold text-blue-300">Chinese · Gong</div>
             </div>
 
-            <div class="space-y-2">
-                <label class="text-[8px] text-gray-400 uppercase font-bold tracking-widest">物理形态</label>
-                <div class="grid grid-cols-2 gap-2">
-                    <button onclick="changeShape('saturn')" class="bg-white/5 hover:bg-white/10 py-2 rounded-lg text-[9px] border border-white/5 transition-all active:scale-95 text-blue-300">经典土星</button>
-                    <button onclick="changeShape('hollow_heart')" class="bg-white/5 hover:bg-white/10 py-2 rounded-lg text-[9px] border border-white/5 transition-all active:scale-95 text-pink-400 font-bold">镂空爱心</button>
-                    <button onclick="changeShape('tree')" class="bg-white/5 hover:bg-white/10 py-2 rounded-lg text-[9px] border border-white/5 transition-all active:scale-95">圣诞树</button>
-                    <button onclick="changeShape('sphere')" class="bg-white/5 hover:bg-white/10 py-2 rounded-lg text-[9px] border border-white/5 transition-all active:scale-95">粒子球体</button>
+            <div class="grid grid-cols-2 gap-2">
+                <div class="space-y-1">
+                    <label class="text-[8px] text-gray-400 uppercase font-bold tracking-widest">Instrument</label>
+                    <div id="panel-instrument" class="text-[10px] font-semibold">Guzheng</div>
+                </div>
+                <div class="space-y-1">
+                    <label class="text-[8px] text-gray-400 uppercase font-bold tracking-widest">Scale</label>
+                    <div id="panel-scale" class="text-[10px] font-mono text-gray-300">C D E G A</div>
                 </div>
             </div>
 
+            <div class="space-y-1">
+                <label class="text-[8px] text-gray-400 uppercase font-bold tracking-widest flex justify-between">
+                    <span>Energy</span><span id="energy-value" class="text-gray-300">40%</span>
+                </label>
+                <div id="energy-control" role="slider" aria-label="Energy" aria-valuemin="0" aria-valuemax="100" aria-valuenow="40" tabindex="0">
+                    <div id="energy-fill"></div>
+                    <div id="energy-knob"></div>
+                </div>
+            </div>
+
+            <div class="flex justify-between text-[8px] text-gray-400 uppercase font-bold tracking-widest">
+                <span>Input</span>
+                <span class="text-white">Mouse + Hand</span>
+            </div>
+
             <div class="pt-3 border-t border-white/10">
-                <div id="hand-status" class="text-[8px] text-center text-red-500 font-mono mb-2 uppercase tracking-widest">Engine Offline</div>
-                <div class="space-y-1 text-[8px] text-gray-400 bg-black/20 p-2 rounded-lg">
-                    <p class="flex justify-between"><span>全向旋转:</span> <span class="text-blue-400">指尖偏移控制</span></p>
-                    <p class="flex justify-between"><span>张开/握拳:</span> <span class="text-white">离散/聚合</span></p>
-                    <p class="flex justify-between"><span>状态:</span> <span id="rot-state" class="text-emerald-400">自由漂浮</span></p>
+                <div id="hand-status" class="text-[8px] text-center font-mono mb-2 uppercase tracking-widest text-red-500">
+                    <span class="status-dot bg-red-500"></span>Hand Engine Offline
+                </div>
+                <div class="space-y-1 text-[8px] text-gray-400 bg-black/20 p-2 rounded-lg font-mono">
+                    <p class="flex justify-between"><span>Move</span><span class="text-blue-300">Pitch</span></p>
+                    <p class="flex justify-between"><span>Height</span><span class="text-blue-300">Tone</span></p>
+                    <p class="flex justify-between"><span>Hold</span><span class="text-white">Play</span></p>
+                    <p class="flex justify-between"><span>Speed</span><span class="text-white">Energy</span></p>
+                    <p class="flex justify-between"><span>Pinch</span><span class="text-emerald-400">Play</span></p>
+                    <p class="flex justify-between"><span>Open</span><span class="text-emerald-400">Space</span></p>
+                    <p class="flex justify-between"><span>Swipe</span><span class="text-pink-400">Scratch</span></p>
                 </div>
             </div>
         </div>
     </div>
 
+    <div id="center-label">
+        <div class="world-name">Chinese · Gong</div>
+        <div class="world-scale-name">Gong Pentatonic</div>
+        <div class="instrument-name">Guzheng</div>
+        <div class="scale-notes">C · D · E · G · A</div>
+    </div>
+
+    <div id="world-deck">
+        <div id="world-fader-label">World</div>
+        <div id="world-fader-track" role="slider" aria-label="Musical world" aria-valuemin="0" aria-valuemax="4" aria-valuenow="0" tabindex="0">
+            <div id="world-fader-line"></div>
+            <div id="world-fader-head"></div>
+        </div>
+        <div class="flex gap-2">
+            <button data-world="0" class="world-btn bg-white/5 hover:bg-white/10 px-2 py-1 rounded-md text-[8px] border border-white/5 uppercase tracking-widest">Chinese</button>
+            <button data-world="1" class="world-btn bg-white/5 hover:bg-white/10 px-2 py-1 rounded-md text-[8px] border border-white/5 uppercase tracking-widest">Japanese</button>
+            <button data-world="2" class="world-btn bg-white/5 hover:bg-white/10 px-2 py-1 rounded-md text-[8px] border border-white/5 uppercase tracking-widest">Celtic</button>
+            <button data-world="3" class="world-btn bg-white/5 hover:bg-white/10 px-2 py-1 rounded-md text-[8px] border border-white/5 uppercase tracking-widest">Egyptian</button>
+            <button data-world="4" class="world-btn bg-white/5 hover:bg-white/10 px-2 py-1 rounded-md text-[8px] border border-white/5 uppercase tracking-widest">Blues</button>
+        </div>
+    </div>
+
     <div id="video-container">
         <video id="input_video" class="w-full h-full object-cover"></video>
+    </div>
+    <div id="hand-badge" class="text-red-400">Hand Control Offline</div>
+
+    <div id="enter-overlay">
+        <h2>Enter the Deck</h2>
+        <p>Click or touch to initialise sound</p>
     </div>
 
     <script>
@@ -75,15 +359,14 @@
         let ringGroups = new THREE.Group();
         let coreColor = new THREE.Color(0x00f2ff);
         const PARTICLE_COUNT = 15000;
-        
+
         let targetPositions = new Float32Array(PARTICLE_COUNT * 3);
         let currentPositions = new Float32Array(PARTICLE_COUNT * 3);
-        let particleOffsets = new Float32Array(PARTICLE_COUNT * 3); 
+        let particleOffsets = new Float32Array(PARTICLE_COUNT * 3);
         let colors = new Float32Array(PARTICLE_COUNT * 3);
-        
+
         let cameraDist = 450;
-        
-        // 双轴旋转控制
+
         let targetRotX = 0, targetRotY = 0;
         let currentRotX = 0, currentRotY = 0;
         let autoRotX = 0.001, autoRotY = 0.002;
@@ -107,7 +390,6 @@
             createEpicRings();
 
             window.addEventListener('resize', onResize);
-            document.getElementById('colorPicker').addEventListener('input', updatePalette);
 
             for(let i=0; i<PARTICLE_COUNT; i++) {
                 particleOffsets[i*3] = (Math.random() - 0.5) * 150;
@@ -115,9 +397,19 @@
                 particleOffsets[i*3+2] = (Math.random() - 0.5) * 150;
             }
 
-            changeShape('hollow_heart');
+            changeShape('sphere');
             animate();
             initMediaPipe();
+            initEnterOverlay();
+        }
+
+        function initEnterOverlay() {
+            const overlay = document.getElementById('enter-overlay');
+            overlay.addEventListener('click', () => {
+                overlay.classList.add('hidden');
+                targetDispersion = 0.9;
+                setTimeout(() => { targetDispersion = 0.05; }, 700);
+            }, { once: true });
         }
 
         function createStarfield() {
@@ -157,22 +449,20 @@
             });
 
             particles = new THREE.Points(geometry, material);
-            updatePalette();
+            updatePalette('#00f2ff');
             scene.add(particles);
         }
 
-        function updatePalette() {
-            const hex = document.getElementById('colorPicker').value;
+        function updatePalette(hex) {
             coreColor.set(hex);
             const tempCol = new THREE.Color();
             for (let i = 0; i < PARTICLE_COUNT; i++) {
                 tempCol.copy(coreColor);
                 const hsl = {};
                 tempCol.getHSL(hsl);
-                // 丰富色彩扩展
                 tempCol.setHSL(
-                    (hsl.h + (Math.random() - 0.5) * 0.4 + 1.0) % 1.0, 
-                    THREE.MathUtils.clamp(hsl.s + (Math.random() - 0.5) * 0.2, 0.5, 1.0), 
+                    (hsl.h + (Math.random() - 0.5) * 0.4 + 1.0) % 1.0,
+                    THREE.MathUtils.clamp(hsl.s + (Math.random() - 0.5) * 0.2, 0.5, 1.0),
                     THREE.MathUtils.clamp(hsl.l + (Math.random() - 0.5) * 0.3, 0.4, 0.8)
                 );
                 colors[i * 3] = tempCol.r;
@@ -197,8 +487,8 @@
                     pos.push(Math.cos(a)*d, (Math.random()-0.5)*3, Math.sin(a)*d);
                 }
                 geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-                const p = new THREE.Points(geo, new THREE.PointsMaterial({ 
-                    color: config.color, size: 1.5, transparent: true, opacity: config.op, blending: THREE.AdditiveBlending 
+                const p = new THREE.Points(geo, new THREE.PointsMaterial({
+                    color: config.color, size: 1.5, transparent: true, opacity: config.op, blending: THREE.AdditiveBlending
                 }));
                 p.rotation.x = Math.PI * 0.45;
                 ringGroups.add(p);
@@ -224,13 +514,12 @@
                         z = Math.sin(a) * r;
                     }
                 } else if (type === 'hollow_heart') {
-                    // 经典 3D 镂空爱心
                     const t = Math.random() * Math.PI * 2;
-                    const p = (Math.random() - 0.5) * Math.PI; // 增加厚度
+                    const p = (Math.random() - 0.5) * Math.PI;
                     const scale = 8;
                     x = 16 * Math.pow(Math.sin(t), 3);
                     y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
-                    z = Math.sin(p) * 15; // 镂空带一点厚度
+                    z = Math.sin(p) * 15;
                     x *= scale; y *= scale; z *= scale;
                 } else if (type === 'tree') {
                     const h = Math.random() * 240;
@@ -262,45 +551,52 @@
                 onFrame: async () => await hands.send({ image: video }),
                 width: 640, height: 480
             });
-            cam.start();
+            cam.start().catch(() => {
+                const badge = document.getElementById('hand-badge');
+                if (badge) badge.textContent = 'No Camera';
+            });
+        }
+
+        function setHandOnline(online) {
+            const status = document.getElementById('hand-status');
+            const badge = document.getElementById('hand-badge');
+            if (online) {
+                status.innerHTML = '<span class="status-dot bg-emerald-400"></span>Hand Engine Online';
+                status.className = 'text-[8px] text-center font-mono mb-2 uppercase tracking-widest text-emerald-400';
+                badge.textContent = 'Hand Control Online';
+                badge.className = 'text-emerald-400';
+            } else {
+                status.innerHTML = '<span class="status-dot bg-red-500"></span>Hand Engine Offline';
+                status.className = 'text-[8px] text-center font-mono mb-2 uppercase tracking-widest text-red-500';
+                badge.textContent = 'Hand Control Offline';
+                badge.className = 'text-red-400';
+            }
         }
 
         function handleHands(res) {
-            const status = document.getElementById('hand-status');
-            const rotState = document.getElementById('rot-state');
-            
             if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
-                status.innerText = "Engine Linked";
-                status.className = "text-[8px] text-center text-green-500 font-mono mb-2 uppercase tracking-widest";
-                rotState.innerText = "手动操控";
-                
+                setHandOnline(true);
                 const lm = res.multiHandLandmarks[0];
-                
-                // 360度 全轴旋转控制
-                // 计算指尖 (lm[8]) 相对于掌心 (lm[9]) 的偏移量
-                const offsetX = lm[8].x - lm[9].x; // 左右偏移控制 Y轴 旋转
-                const offsetY = lm[8].y - lm[9].y; // 上下偏移控制 X轴 旋转
-                
-                targetRotY = offsetX * -0.5; // 水平位移 -> 绕Y轴转
-                targetRotX = offsetY * 0.5;  // 垂直位移 -> 绕X轴转
 
-                // 远近与离散控制
+                const offsetX = lm[8].x - lm[9].x;
+                const offsetY = lm[8].y - lm[9].y;
+
+                targetRotY = offsetX * -0.5;
+                targetRotX = offsetY * 0.5;
+
                 const d80 = Math.hypot(lm[8].x - lm[0].x, lm[8].y - lm[0].y);
                 if (d80 < 0.25) {
                     cameraDist += 15;
-                    targetDispersion = 0; 
+                    targetDispersion = 0;
                 } else if (d80 > 0.45) {
-                    cameraDist -= (cameraDist - 120) * 0.15; 
-                    targetDispersion = 1.0; 
+                    cameraDist -= (cameraDist - 120) * 0.15;
+                    targetDispersion = 1.0;
                 } else {
                     targetDispersion = 0.05;
                 }
                 cameraDist = THREE.MathUtils.clamp(cameraDist, 180, 1600);
             } else {
-                status.innerText = "Engine Offline";
-                status.className = "text-[8px] text-center text-red-500 font-mono mb-2 uppercase tracking-widest";
-                rotState.innerText = "自由漂浮";
-                // 失去手势时回归自动旋转
+                setHandOnline(false);
                 targetRotX = autoRotX;
                 targetRotY = autoRotY;
                 targetDispersion *= 0.96;
@@ -309,16 +605,15 @@
 
         function animate() {
             requestAnimationFrame(animate);
-            
-            // 平滑旋转插值
+
             currentRotX += (targetRotX - currentRotX) * 0.05;
             currentRotY += (targetRotY - currentRotY) * 0.05;
-            
+
             particles.rotation.x += currentRotX;
             particles.rotation.y += currentRotY;
             ringGroups.rotation.x += currentRotX * 0.8;
             ringGroups.rotation.y += currentRotY * 0.8;
-            
+
             currentDispersion += (targetDispersion - currentDispersion) * 0.04;
 
             const posAttr = particles.geometry.attributes.position;
@@ -333,7 +628,7 @@
                 currentPositions[i3+2] += (tz - currentPositions[i3+2]) * 0.1;
             }
             posAttr.needsUpdate = true;
-            
+
             ringGroups.visible = currentDispersion < 0.65;
             camera.position.z += (cameraDist - camera.position.z) * 0.1;
             camera.lookAt(0, 0, 0);
