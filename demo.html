@@ -1392,33 +1392,60 @@
             }
         }
 
+        // ---- Hand performance: the same X->pitch / Y->timbre / hold->play
+        // mapping as the mouse, so the webcam is a genuine alternative
+        // instrument, not a decoration. X is mirrored to match the mirrored
+        // preview (move your hand right -> pitch goes up, as seen on screen).
+        let handPinched = false;
+
         function handleHands(res) {
             if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
                 setHandOnline(true);
                 const lm = res.multiHandLandmarks[0];
 
-                const offsetX = lm[8].x - lm[9].x;
-                const offsetY = lm[8].y - lm[9].y;
+                const handX = THREE.MathUtils.clamp(1 - lm[8].x, 0, 1);
+                const handY = THREE.MathUtils.clamp(lm[8].y, 0, 1);
 
-                targetRotY = offsetX * -0.5;
-                targetRotX = offsetY * 0.5;
+                targetRotY = (handX - 0.5) * 0.02;
+                targetRotX = (handY - 0.5) * 0.01;
 
-                const d80 = Math.hypot(lm[8].x - lm[0].x, lm[8].y - lm[0].y);
-                if (d80 < 0.25) {
-                    cameraDist += 15;
-                    targetDispersion = 0;
-                } else if (d80 > 0.45) {
-                    cameraDist -= (cameraDist - 120) * 0.15;
-                    targetDispersion = 1.0;
-                } else {
-                    targetDispersion = 0.05;
+                // Openness: average fingertip-to-wrist spread across the four
+                // fingers. Open hand -> more space/reverb/dispersion; closed
+                // fist -> particles and sound pull back in tight.
+                const spread = (
+                    Math.hypot(lm[8].x - lm[0].x, lm[8].y - lm[0].y) +
+                    Math.hypot(lm[12].x - lm[0].x, lm[12].y - lm[0].y) +
+                    Math.hypot(lm[16].x - lm[0].x, lm[16].y - lm[0].y) +
+                    Math.hypot(lm[20].x - lm[0].x, lm[20].y - lm[0].y)
+                ) / 4;
+                const openness = THREE.MathUtils.clamp((spread - 0.15) / (0.35 - 0.15), 0, 1);
+                targetDispersion = openness * 0.55;
+                if (AudioEngine.started) AudioEngine.setReverbAmount(0.12 + openness * 0.4);
+
+                // Pinch (thumb tip 4, index tip 8) -> note on, sustained
+                // while pinched, released when the fingers separate.
+                const pinchDist = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
+                const pinched = pinchDist < 0.06;
+                const world = currentWorld();
+
+                if (pinched && !handPinched) {
+                    ensureAudioStarted();
+                    handPinched = true;
+                    if (world.synthType === 'sustain') startSustainNote(world, handX, handY);
+                    else { pluckLastMidi = null; playPluckAt(handX, handY); }
+                } else if (pinched && handPinched) {
+                    if (world.synthType === 'sustain') glideSustainNote(world, handX, handY);
+                    else playPluckAt(handX, handY);
+                } else if (!pinched && handPinched) {
+                    handPinched = false;
+                    releaseHeldNote();
                 }
-                cameraDist = THREE.MathUtils.clamp(cameraDist, 180, 1600);
             } else {
                 setHandOnline(false);
                 targetRotX = autoRotX;
                 targetRotY = autoRotY;
                 targetDispersion *= 0.96;
+                if (handPinched) { handPinched = false; releaseHeldNote(); }
             }
         }
 
