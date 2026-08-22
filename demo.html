@@ -858,6 +858,40 @@
         }
         SHAPE_GENERATORS.guzheng = guzhengShape;
 
+        // Koto: longer and narrower than the guzheng, with a cleaner, more
+        // minimalist body (less scatter) and sparser, more evenly-spaced
+        // strings — restrained ripples rather than dense bridge clusters.
+        function kotoShape(i, N, out, o) {
+            const L = 330, W = 46, H = 12;
+            const bodyCount = Math.floor(N * 0.4);
+            const stringCount = Math.floor(N * 0.52);
+            const numStrings = 13;
+            let x, y, z;
+            if (i < bodyCount) {
+                const u = Math.random();
+                const v = Math.random() - 0.5;
+                x = (u - 0.5) * L;
+                z = v * W;
+                y = Math.sin(u * Math.PI) * H + (Math.random() - 0.5) * 1.6;
+            } else if (i < bodyCount + stringCount) {
+                const s = Math.floor(Math.random() * numStrings);
+                const stringZ = (s / (numStrings - 1) - 0.5) * (W * 0.82);
+                const u = Math.random();
+                x = (u - 0.5) * L;
+                z = stringZ + (Math.random() - 0.5) * 0.35;
+                y = Math.sin(u * Math.PI) * H + 2 + (Math.random() - 0.5) * 0.3;
+            } else {
+                const s = Math.floor(Math.random() * numStrings);
+                const stringZ = (s / (numStrings - 1) - 0.5) * (W * 0.82);
+                const bridgeU = 0.5 + (Math.random() - 0.5) * 0.06;
+                x = (bridgeU - 0.5) * L;
+                z = stringZ + (Math.random() - 0.5) * 1.2;
+                y = Math.sin(bridgeU * Math.PI) * H + 4 + (Math.random() - 0.5) * 1.2;
+            }
+            out[o] = x; out[o + 1] = y; out[o + 2] = z;
+        }
+        SHAPE_GENERATORS.koto = kotoShape;
+
         const WORLDS = [
             {
                 key: 'chinese', name: 'Chinese · Gong', scaleName: 'Gong Pentatonic',
@@ -873,7 +907,7 @@
                 intervals: [0, 1, 5, 7, 10], synthType: 'pluck',
                 synth: { decay: 1.1, damping: 6200, feedback: 0.982, body: 1400, bendChance: 0.06 },
                 palette: { hue: 0.97, hueSpread: 0.04, satRange: [0.1, 0.35], lightRange: [0.55, 0.85], accentHue: 0.98, accentChance: 0.15 },
-                shapeKey: 'guzheng'
+                shapeKey: 'koto'
             },
             {
                 key: 'celtic', name: 'Celtic · Dorian', scaleName: 'Dorian',
