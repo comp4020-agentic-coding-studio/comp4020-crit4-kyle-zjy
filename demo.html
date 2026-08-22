@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>粒子星际交互系统_jinlin</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; color: white; font-family: 'Inter', sans-serif; }
+        canvas { display: block; }
+        #video-container {
+            position: absolute;
+            bottom: 15px;
+            right: 15px;
+            width: 160px;
+            height: 120px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            overflow: hidden;
+            transform: scaleX(-1);
+            background: #000;
+            z-index: 10;
+        }
+        .panel {
+            background: rgba(10, 10, 10, 0.5);
+            backdrop-filter: blur(15px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            pointer-events: auto;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer" class="absolute top-4 left-4 pointer-events-none z-20">
+        <div class="panel w-60 p-4 rounded-2xl space-y-4 shadow-2xl">
+            <h1 class="text-base font-black italic tracking-tighter bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-emerald-500">
+                ASTRO SPHERE V6
+            </h1>
+            
+            <div class="space-y-1">
+                <label class="text-[8px] text-gray-400 uppercase font-bold tracking-widest">核心色彩 (衍生多色)</label>
+                <input type="color" id="colorPicker" value="#00f2ff" class="w-full h-7 rounded-lg cursor-pointer bg-transparent border-none">
+            </div>
+
+            <div class="space-y-2">
+                <label class="text-[8px] text-gray-400 uppercase font-bold tracking-widest">物理形态</label>
+                <div class="grid grid-cols-2 gap-2">
+                    <button onclick="changeShape('saturn')" class="bg-white/5 hover:bg-white/10 py-2 rounded-lg text-[9px] border border-white/5 transition-all active:scale-95 text-blue-300">经典土星</button>
+                    <button onclick="changeShape('hollow_heart')" class="bg-white/5 hover:bg-white/10 py-2 rounded-lg text-[9px] border border-white/5 transition-all active:scale-95 text-pink-400 font-bold">镂空爱心</button>
+                    <button onclick="changeShape('tree')" class="bg-white/5 hover:bg-white/10 py-2 rounded-lg text-[9px] border border-white/5 transition-all active:scale-95">圣诞树</button>
+                    <button onclick="changeShape('sphere')" class="bg-white/5 hover:bg-white/10 py-2 rounded-lg text-[9px] border border-white/5 transition-all active:scale-95">粒子球体</button>
+                </div>
+            </div>
+
+            <div class="pt-3 border-t border-white/10">
+                <div id="hand-status" class="text-[8px] text-center text-red-500 font-mono mb-2 uppercase tracking-widest">Engine Offline</div>
+                <div class="space-y-1 text-[8px] text-gray-400 bg-black/20 p-2 rounded-lg">
+                    <p class="flex justify-between"><span>全向旋转:</span> <span class="text-blue-400">指尖偏移控制</span></p>
+                    <p class="flex justify-between"><span>张开/握拳:</span> <span class="text-white">离散/聚合</span></p>
+                    <p class="flex justify-between"><span>状态:</span> <span id="rot-state" class="text-emerald-400">自由漂浮</span></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="video-container">
+        <video id="input_video" class="w-full h-full object-cover"></video>
+    </div>
+
+    <script>
+        let scene, camera, renderer, starfield, particles;
+        let ringGroups = new THREE.Group();
+        let coreColor = new THREE.Color(0x00f2ff);
+        const PARTICLE_COUNT = 15000;
+        
+        let targetPositions = new Float32Array(PARTICLE_COUNT * 3);
+        let currentPositions = new Float32Array(PARTICLE_COUNT * 3);
+        let particleOffsets = new Float32Array(PARTICLE_COUNT * 3); 
+        let colors = new Float32Array(PARTICLE_COUNT * 3);
+        
+        let cameraDist = 450;
+        
+        // 双轴旋转控制
+        let targetRotX = 0, targetRotY = 0;
+        let currentRotX = 0, currentRotY = 0;
+        let autoRotX = 0.001, autoRotY = 0.002;
+
+        let targetDispersion = 0;
+        let currentDispersion = 0;
+
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 5000);
+            camera.position.z = cameraDist;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            document.body.appendChild(renderer.domElement);
+
+            createStarfield();
+            createGlowParticles();
+            scene.add(ringGroups);
+            createEpicRings();
+
+            window.addEventListener('resize', onResize);
+            document.getElementById('colorPicker').addEventListener('input', updatePalette);
+
+            for(let i=0; i<PARTICLE_COUNT; i++) {
+                particleOffsets[i*3] = (Math.random() - 0.5) * 150;
+                particleOffsets[i*3+1] = (Math.random() - 0.5) * 150;
+                particleOffsets[i*3+2] = (Math.random() - 0.5) * 150;
+            }
+
+            changeShape('hollow_heart');
+            animate();
+            initMediaPipe();
+        }
+
+        function createStarfield() {
+            const geo = new THREE.BufferGeometry();
+            const pos = [];
+            for(let i=0; i<1500; i++) {
+                pos.push(THREE.MathUtils.randFloatSpread(5000), THREE.MathUtils.randFloatSpread(5000), THREE.MathUtils.randFloatSpread(5000));
+            }
+            geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+            starfield = new THREE.Points(geo, new THREE.PointsMaterial({ color: 0x222222, size: 1 }));
+            scene.add(starfield);
+        }
+
+        function createGlowParticles() {
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(currentPositions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const canvas = document.createElement('canvas');
+            canvas.width = 64; canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+            grad.addColorStop(0, 'rgba(255,255,255,1)');
+            grad.addColorStop(0.3, 'rgba(255,255,255,0.7)');
+            grad.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 64, 64);
+            const texture = new THREE.CanvasTexture(canvas);
+
+            const material = new THREE.PointsMaterial({
+                size: 3.0,
+                vertexColors: true,
+                map: texture,
+                transparent: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            particles = new THREE.Points(geometry, material);
+            updatePalette();
+            scene.add(particles);
+        }
+
+        function updatePalette() {
+            const hex = document.getElementById('colorPicker').value;
+            coreColor.set(hex);
+            const tempCol = new THREE.Color();
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                tempCol.copy(coreColor);
+                const hsl = {};
+                tempCol.getHSL(hsl);
+                // 丰富色彩扩展
+                tempCol.setHSL(
+                    (hsl.h + (Math.random() - 0.5) * 0.4 + 1.0) % 1.0, 
+                    THREE.MathUtils.clamp(hsl.s + (Math.random() - 0.5) * 0.2, 0.5, 1.0), 
+                    THREE.MathUtils.clamp(hsl.l + (Math.random() - 0.5) * 0.3, 0.4, 0.8)
+                );
+                colors[i * 3] = tempCol.r;
+                colors[i * 3 + 1] = tempCol.g;
+                colors[i * 3 + 2] = tempCol.b;
+            }
+            particles.geometry.attributes.color.needsUpdate = true;
+        }
+
+        function createEpicRings() {
+            ringGroups.clear();
+            const ringConfigs = [
+                { r: 210, w: 20, count: 800, color: 0xffffff, op: 0.2 },
+                { r: 280, w: 40, count: 1000, color: 0x00f2ff, op: 0.1 }
+            ];
+            ringConfigs.forEach((config) => {
+                const geo = new THREE.BufferGeometry();
+                const pos = [];
+                for(let i=0; i<config.count; i++) {
+                    const a = Math.random() * Math.PI * 2;
+                    const d = config.r + (Math.random() - 0.5) * config.w;
+                    pos.push(Math.cos(a)*d, (Math.random()-0.5)*3, Math.sin(a)*d);
+                }
+                geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+                const p = new THREE.Points(geo, new THREE.PointsMaterial({ 
+                    color: config.color, size: 1.5, transparent: true, opacity: config.op, blending: THREE.AdditiveBlending 
+                }));
+                p.rotation.x = Math.PI * 0.45;
+                ringGroups.add(p);
+            });
+        }
+
+        function changeShape(type) {
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                let x, y, z;
+                if (type === 'saturn') {
+                    if (i < PARTICLE_COUNT * 0.5) {
+                        const phi = Math.acos(-1 + (2 * i) / (PARTICLE_COUNT * 0.5));
+                        const theta = Math.sqrt(PARTICLE_COUNT * 0.5 * Math.PI) * phi;
+                        const r = 90;
+                        x = r * Math.cos(theta) * Math.sin(phi);
+                        y = r * Math.sin(theta) * Math.sin(phi);
+                        z = r * Math.cos(phi);
+                    } else {
+                        const a = Math.random() * Math.PI * 2;
+                        const r = 130 + Math.random() * 60;
+                        x = Math.cos(a) * r;
+                        y = (Math.random() - 0.5) * 4;
+                        z = Math.sin(a) * r;
+                    }
+                } else if (type === 'hollow_heart') {
+                    // 经典 3D 镂空爱心
+                    const t = Math.random() * Math.PI * 2;
+                    const p = (Math.random() - 0.5) * Math.PI; // 增加厚度
+                    const scale = 8;
+                    x = 16 * Math.pow(Math.sin(t), 3);
+                    y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+                    z = Math.sin(p) * 15; // 镂空带一点厚度
+                    x *= scale; y *= scale; z *= scale;
+                } else if (type === 'tree') {
+                    const h = Math.random() * 240;
+                    const r = (240 - h) * 0.4;
+                    const a = h * 0.6 + i * 0.05;
+                    x = Math.cos(a) * r;
+                    y = h - 120;
+                    z = Math.sin(a) * r;
+                } else if (type === 'sphere') {
+                    const phi = Math.acos(-1 + (2 * i) / PARTICLE_COUNT);
+                    const theta = Math.sqrt(PARTICLE_COUNT * Math.PI) * phi;
+                    const r = 110;
+                    x = r * Math.cos(theta) * Math.sin(phi);
+                    y = r * Math.sin(theta) * Math.sin(phi);
+                    z = r * Math.cos(phi);
+                }
+                targetPositions[i*3] = x;
+                targetPositions[i*3+1] = y;
+                targetPositions[i*3+2] = z;
+            }
+        }
+
+        function initMediaPipe() {
+            const video = document.getElementById('input_video');
+            const hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+            hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.8, minTrackingConfidence: 0.8 });
+            hands.onResults(handleHands);
+            const cam = new Camera(video, {
+                onFrame: async () => await hands.send({ image: video }),
+                width: 640, height: 480
+            });
+            cam.start();
+        }
+
+        function handleHands(res) {
+            const status = document.getElementById('hand-status');
+            const rotState = document.getElementById('rot-state');
+            
+            if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
+                status.innerText = "Engine Linked";
+                status.className = "text-[8px] text-center text-green-500 font-mono mb-2 uppercase tracking-widest";
+                rotState.innerText = "手动操控";
+                
+                const lm = res.multiHandLandmarks[0];
+                
+                // 360度 全轴旋转控制
+                // 计算指尖 (lm[8]) 相对于掌心 (lm[9]) 的偏移量
+                const offsetX = lm[8].x - lm[9].x; // 左右偏移控制 Y轴 旋转
+                const offsetY = lm[8].y - lm[9].y; // 上下偏移控制 X轴 旋转
+                
+                targetRotY = offsetX * -0.5; // 水平位移 -> 绕Y轴转
+                targetRotX = offsetY * 0.5;  // 垂直位移 -> 绕X轴转
+
+                // 远近与离散控制
+                const d80 = Math.hypot(lm[8].x - lm[0].x, lm[8].y - lm[0].y);
+                if (d80 < 0.25) {
+                    cameraDist += 15;
+                    targetDispersion = 0; 
+                } else if (d80 > 0.45) {
+                    cameraDist -= (cameraDist - 120) * 0.15; 
+                    targetDispersion = 1.0; 
+                } else {
+                    targetDispersion = 0.05;
+                }
+                cameraDist = THREE.MathUtils.clamp(cameraDist, 180, 1600);
+            } else {
+                status.innerText = "Engine Offline";
+                status.className = "text-[8px] text-center text-red-500 font-mono mb-2 uppercase tracking-widest";
+                rotState.innerText = "自由漂浮";
+                // 失去手势时回归自动旋转
+                targetRotX = autoRotX;
+                targetRotY = autoRotY;
+                targetDispersion *= 0.96;
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            // 平滑旋转插值
+            currentRotX += (targetRotX - currentRotX) * 0.05;
+            currentRotY += (targetRotY - currentRotY) * 0.05;
+            
+            particles.rotation.x += currentRotX;
+            particles.rotation.y += currentRotY;
+            ringGroups.rotation.x += currentRotX * 0.8;
+            ringGroups.rotation.y += currentRotY * 0.8;
+            
+            currentDispersion += (targetDispersion - currentDispersion) * 0.04;
+
+            const posAttr = particles.geometry.attributes.position;
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const i3 = i * 3;
+                let tx = targetPositions[i3] + particleOffsets[i3] * currentDispersion;
+                let ty = targetPositions[i3+1] + particleOffsets[i3+1] * currentDispersion;
+                let tz = targetPositions[i3+2] + particleOffsets[i3+2] * currentDispersion;
+
+                currentPositions[i3] += (tx - currentPositions[i3]) * 0.1;
+                currentPositions[i3+1] += (ty - currentPositions[i3+1]) * 0.1;
+                currentPositions[i3+2] += (tz - currentPositions[i3+2]) * 0.1;
+            }
+            posAttr.needsUpdate = true;
+            
+            ringGroups.visible = currentDispersion < 0.65;
+            camera.position.z += (cameraDist - camera.position.z) * 0.1;
+            camera.lookAt(0, 0, 0);
+            starfield.rotation.y += 0.0002;
+            renderer.render(scene, camera);
+        }
+
+        function onResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        init();
+    </script>
+</body>
+</html>
