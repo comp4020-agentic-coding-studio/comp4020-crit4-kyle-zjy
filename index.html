@@ -272,6 +272,27 @@
             color: rgba(255,255,255,0.5);
         }
 
+        #technique-flash {
+            position: absolute;
+            top: 34%;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 6;
+            pointer-events: none;
+            font-size: 11px;
+            letter-spacing: 0.35em;
+            font-weight: 900;
+            text-transform: uppercase;
+            color: #fff;
+            text-shadow: 0 0 12px rgba(0, 242, 255, 0.85);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        #technique-meter-fill {
+            transition: width 0.12s linear;
+        }
+
         @media (max-width: 640px) {
             #video-container, #hand-badge { display: none; }
         }
@@ -315,6 +336,15 @@
                 </div>
             </div>
 
+            <div class="space-y-1">
+                <label class="text-[8px] text-gray-400 uppercase font-bold tracking-widest flex justify-between">
+                    <span id="technique-meter-label-a">PLUCK</span><span id="technique-meter-label-b">GLISS</span>
+                </label>
+                <div class="relative w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
+                    <div id="technique-meter-fill" class="absolute inset-y-0 left-0 bg-gradient-to-r from-blue-400 to-pink-400" style="width:20%"></div>
+                </div>
+            </div>
+
             <div class="flex justify-between text-[8px] text-gray-400 uppercase font-bold tracking-widest">
                 <span>Input</span>
                 <span class="text-white">Mouse + Hand</span>
@@ -322,16 +352,16 @@
 
             <div class="pt-3 border-t border-white/10">
                 <div id="hand-status" class="text-[8px] text-center font-mono mb-2 uppercase tracking-widest text-red-500">
-                    <span class="status-dot bg-red-500"></span>Hand Engine Offline
+                    <span class="status-dot bg-red-500"></span>Hand Offline
                 </div>
                 <div class="space-y-1 text-[8px] text-gray-400 bg-black/20 p-2 rounded-lg font-mono">
                     <p class="flex justify-between"><span>Move</span><span class="text-blue-300">Pitch</span></p>
-                    <p class="flex justify-between"><span>Height</span><span class="text-blue-300">Tone</span></p>
+                    <p class="flex justify-between"><span>Height</span><span class="text-blue-300">Technique</span></p>
                     <p class="flex justify-between"><span>Hold</span><span class="text-white">Play</span></p>
                     <p class="flex justify-between"><span>Speed</span><span class="text-white">Energy</span></p>
                     <p class="flex justify-between"><span>Pinch</span><span class="text-emerald-400">Play</span></p>
                     <p class="flex justify-between"><span>Open</span><span class="text-emerald-400">Space</span></p>
-                    <p class="flex justify-between"><span>Swipe</span><span class="text-pink-400">Scratch</span></p>
+                    <p class="flex justify-between"><span id="technique-hint-key">Swipe</span><span id="technique-hint-value" class="text-pink-400">Gliss</span></p>
                 </div>
             </div>
         </div>
@@ -343,6 +373,7 @@
         <div class="instrument-name">Guzheng</div>
         <div class="scale-notes">C · D · E · G · A</div>
     </div>
+    <div id="technique-flash"></div>
 
     <div id="world-deck">
         <div id="world-fader-label">World</div>
@@ -374,8 +405,14 @@
         import {
             SCALES,
             midiToFreq, midiToName,
-            createNoteResolver,
+            createNoteResolver, midiForZoneIndex,
         } from './src/scale.ts';
+        import {
+            createGestureHistory, createCooldownTracker, createPinchTracker,
+            createEmaSmoother, computeSample, computeHandOpenness,
+            detectHorizontalSwipe, detectDownwardStrike, detectRapidShake,
+            detectFastReversal, detectCircularMotion, detectStillHold,
+        } from './src/gestures.ts';
 
         let scene, camera, renderer, starfield, particles;
         let ringGroups = new THREE.Group();
@@ -526,11 +563,27 @@
         function setEnergyKnob(v01) {
             energyKnob = THREE.MathUtils.clamp(v01, 0, 1);
             updateEnergyVisual(energyKnob);
+            // Mouse/trackpad equivalent of hand openness (section 22/28): a
+            // mouse can't physically open or close, so when no hand is
+            // online this existing slider drives the same space/dispersion
+            // parameter hand openness would otherwise control.
+            if (!handOnline) applySpaceAmount(energyKnob);
+        }
+
+        // ---- Space/dispersion (section 21-23): one continuous 0..1 amount
+        // drives reverb send + particle dispersion, sourced from hand
+        // openness when a hand is tracked, from the ENERGY slider otherwise
+        // — so the instrument is fully playable with no webcam. ----
+        function applySpaceAmount(amount) {
+            targetDispersion = amount * 0.55;
+            const base = amount < 0.12 ? 0.04 : 0.12; // fist/closed: tighten further
+            if (AudioEngine.started) AudioEngine.setReverbAmount(base + amount * 0.4);
         }
 
         function initEnergyControl() {
             const control = document.getElementById('energy-control');
             updateEnergyVisual(energyKnob);
+            applySpaceAmount(energyKnob);
 
             const valueFromClientX = (clientX) => {
                 const rect = control.getBoundingClientRect();
@@ -566,27 +619,24 @@
 
             surface.addEventListener('pointerdown', (e) => {
                 surface.setPointerCapture(e.pointerId);
+                pointerHeld = true;
                 const x = e.clientX / window.innerWidth, y = e.clientY / window.innerHeight;
-                lastPointerX = x; lastPointerT = performance.now();
-                handlePointerDown(x, y);
+                pointerX = x; pointerY = y;
+                updatePerformanceInput({ source: 'mouse', x, y, active: true, timestamp: performance.now() });
             });
             surface.addEventListener('pointermove', (e) => {
                 const x = e.clientX / window.innerWidth, y = e.clientY / window.innerHeight;
-                const t = performance.now();
-                const dt = Math.max(1, t - lastPointerT);
-                const dx = x - lastPointerX;
-                pointerVelocity = Math.abs(dx) / (dt / 1000);
-                const dir = dx > 0.0015 ? 1 : (dx < -0.0015 ? -1 : 0);
-                if (dir !== 0 && lastPointerDir !== 0 && dir !== lastPointerDir && pointerVelocity > SCRATCH_VELOCITY_THRESHOLD) {
-                    maybeTriggerScratch(dir, pointerVelocity);
-                }
-                if (dir !== 0) lastPointerDir = dir;
-                lastPointerX = x; lastPointerT = t;
                 pointerX = x; pointerY = y;
-                handlePointerMove(x, y);
+                if (pointerHeld) {
+                    updatePerformanceInput({ source: 'mouse', x, y, active: true, timestamp: performance.now() });
+                }
             });
-            surface.addEventListener('pointerup', handlePointerUp);
-            surface.addEventListener('pointercancel', handlePointerUp);
+            const releasePointer = () => {
+                pointerHeld = false;
+                updatePerformanceInput({ source: 'mouse', x: pointerX, y: pointerY, active: false, timestamp: performance.now() });
+            };
+            surface.addEventListener('pointerup', releasePointer);
+            surface.addEventListener('pointercancel', releasePointer);
 
             // Optional FX control: wheel over the instrument itself dials
             // reverb space in/out, without touching page scroll (there is
@@ -865,9 +915,44 @@
                 osc2.detune.linearRampToValueAtTime(s.detune, now + 0.15);
             }
 
+            // Chinese-only: near the top of the Y range (the guzheng's
+            // "pressed string" position), a subtle upward bend right after
+            // the pluck's attack — the same post-pluck press technique
+            // players use to raise a note's pitch after striking it.
+            const pressIntensity = world.key === 'chinese' ? THREE.MathUtils.clamp((0.25 - yRatio) / 0.25, 0, 1) : 0;
+            if (pressIntensity > 0) {
+                const pressAt = now + Math.max(0.005, s.attack);
+                osc1.detune.setValueAtTime(0, pressAt);
+                osc1.detune.linearRampToValueAtTime(25 * pressIntensity, pressAt + 0.12);
+                osc2.detune.setValueAtTime(s.detune, pressAt);
+                osc2.detune.linearRampToValueAtTime(s.detune + 25 * pressIntensity, pressAt + 0.12);
+            }
+
             const mixGain = ctx.createGain();
             osc1.connect(mixGain);
             osc2.connect(mixGain);
+
+            // Egyptian-only: a breath-noise layer under the tone, growing
+            // with Y intensity — richer air/breath character at the high
+            // end, never simply louder, and never touching pitch identity.
+            let breathNoise = null, breathFilter = null, breathGain = null;
+            const breathAmount = world.key === 'egyptian' ? THREE.MathUtils.clamp((0.6 - yRatio) / 0.6, 0, 1) : 0;
+            if (breathAmount > 0) {
+                breathNoise = ctx.createBufferSource();
+                breathNoise.buffer = makeNoiseBuffer(ctx, Math.max(0.3, s.attack + s.decay + 0.4));
+                breathNoise.loop = true;
+                breathFilter = ctx.createBiquadFilter();
+                breathFilter.type = 'bandpass';
+                breathFilter.frequency.value = freq * 2.5;
+                breathFilter.Q.value = 1.2;
+                breathGain = ctx.createGain();
+                breathGain.gain.setValueAtTime(0.0001, now);
+                breathGain.gain.linearRampToValueAtTime(0.05 + breathAmount * 0.09, now + Math.max(0.02, s.attack));
+                breathNoise.connect(breathFilter);
+                breathFilter.connect(breathGain);
+                breathGain.connect(mixGain);
+                breathNoise.start(now);
+            }
 
             const filter = ctx.createBiquadFilter();
             filter.type = 'lowpass';
@@ -903,8 +988,10 @@
                 ampGain.gain.linearRampToValueAtTime(0.0001, t + rel);
                 const stopAt = t + rel + 0.05;
                 try { osc1.stop(stopAt); osc2.stop(stopAt); } catch (e) {}
+                if (breathNoise) { try { breathNoise.stop(stopAt); } catch (e) {} }
                 setTimeout(() => {
                     try { osc1.disconnect(); osc2.disconnect(); mixGain.disconnect(); filter.disconnect(); ampGain.disconnect(); } catch (e) {}
+                    if (breathNoise) { try { breathNoise.disconnect(); breathFilter.disconnect(); breathGain.disconnect(); } catch (e) {} }
                 }, (stopAt - t) * 1000 + 100);
             }
 
@@ -915,12 +1002,65 @@
                 setTimeout(() => doRelease(s.release), (attackTime + s.decay) * 1000);
             }
 
+            let bendCents = 0;
             return {
                 setBrightness(yRatioNew) {
                     if (released) return;
                     const t = ctx.currentTime;
                     const cutoff = Math.min(nyquist, s.filterBase + s.filterEnv * (1 - yRatioNew) + velocity * 2000);
                     filter.frequency.setTargetAtTime(cutoff, t, 0.05);
+                },
+                // Egyptian breath ornament (section 16): an irregular vibrato
+                // wobble plus a brief breath-noise brightening, both anchored
+                // back to the exact currently-scheduled pitch/cutoff — the
+                // held note's identity never actually moves.
+                applyOrnament(depthCents, durationMs) {
+                    if (released) return;
+                    const t = ctx.currentTime;
+                    const wobbles = 3 + Math.floor(Math.random() * 2);
+                    let at = t;
+                    osc1.detune.cancelScheduledValues(t);
+                    osc2.detune.cancelScheduledValues(t);
+                    osc1.detune.setValueAtTime(bendCents, t);
+                    osc2.detune.setValueAtTime(s.detune + bendCents, t);
+                    for (let i = 0; i < wobbles; i++) {
+                        at += (durationMs / wobbles / 1000) * (0.6 + Math.random() * 0.8);
+                        const wobble = (Math.random() * 2 - 1) * depthCents;
+                        osc1.detune.linearRampToValueAtTime(bendCents + wobble, at);
+                        osc2.detune.linearRampToValueAtTime(s.detune + bendCents + wobble, at);
+                    }
+                    osc1.detune.linearRampToValueAtTime(bendCents, t + durationMs / 1000);
+                    osc2.detune.linearRampToValueAtTime(s.detune + bendCents, t + durationMs / 1000);
+                    const cutoff = Math.min(nyquist, filter.frequency.value * 1.3);
+                    filter.frequency.setTargetAtTime(cutoff, t, 0.04);
+                    filter.frequency.setTargetAtTime(filter.frequency.value, t + durationMs / 1000, 0.08);
+                },
+                // Blues reversal bend (section 19): a temporary downward
+                // detune plus reed saturation cue, always settling back onto
+                // the exact discrete note — never a permanent detune.
+                applyBend(depthSemitones, durationMs) {
+                    if (released) return;
+                    const t = ctx.currentTime;
+                    const dip = -depthSemitones * 100;
+                    osc1.detune.cancelScheduledValues(t);
+                    osc2.detune.cancelScheduledValues(t);
+                    osc1.detune.setValueAtTime(bendCents, t);
+                    osc2.detune.setValueAtTime(s.detune + bendCents, t);
+                    osc1.detune.linearRampToValueAtTime(bendCents + dip, t + 0.03);
+                    osc2.detune.linearRampToValueAtTime(s.detune + bendCents + dip, t + 0.03);
+                    osc1.detune.linearRampToValueAtTime(bendCents, t + durationMs / 1000);
+                    osc2.detune.linearRampToValueAtTime(s.detune + bendCents, t + durationMs / 1000);
+                },
+                // Blues continuous Y-bend (section 18): expressive reed
+                // control around the held note — clean at rest, growing
+                // vibrato/bend as `amount` rises, but always centred back on
+                // the exact discrete note the moment amount returns to 0.
+                setBendAmount(amount) {
+                    if (released) return;
+                    const t = ctx.currentTime;
+                    bendCents = -amount * 45;
+                    osc1.detune.setTargetAtTime(bendCents, t, 0.03);
+                    osc2.detune.setTargetAtTime(s.detune + bendCents, t, 0.03);
                 },
                 release(relTime) { doRelease(relTime); },
             };
@@ -1189,7 +1329,7 @@
                 instrumentName: 'Ney', notesLabel: 'C · D · F · G · B♭',
                 intervals: SCALES.egyptianPentatonic, synthType: 'sustain',
                 baseMidi: 60, octaveSpan: 3,
-                crossfadeMs: 90,
+                crossfadeMs: 90, dronePulse: true,
                 synth: { type: 'sine', attack: 0.15, decay: 0.4, sustain: 0.7, release: 0.6, filterBase: 800, filterEnv: 2000, res: 3, detune: 8 },
                 effects: { reverb: 0.4, delay: 0.2, distortion: 0.05 },
                 palette: { hue: 0.09, hueSpread: 0.05, satRange: [0.4, 0.75], lightRange: [0.4, 0.65], accentHue: 0.6, accentChance: 0.12 },
@@ -1228,6 +1368,20 @@
                 b.classList.toggle('text-blue-300', Number(b.dataset.world) === currentWorldIndex);
             });
             updateFaderVisual(currentWorldIndex);
+            const hint = TECHNIQUE_HINTS[world.key];
+            const hintKeyEl = document.getElementById('technique-hint-key');
+            const hintValueEl = document.getElementById('technique-hint-value');
+            if (hint && hintKeyEl && hintValueEl) {
+                hintKeyEl.textContent = hint[0];
+                hintValueEl.textContent = hint[1];
+            }
+            const labels = TECHNIQUE_METER_LABELS[world.key];
+            if (labels) {
+                const a = document.getElementById('technique-meter-label-a');
+                const b = document.getElementById('technique-meter-label-b');
+                if (a) a.textContent = labels[0];
+                if (b) b.textContent = labels[1];
+            }
         }
 
         function switchWorld(index) {
@@ -1236,6 +1390,11 @@
             const world = currentWorld();
             releaseHeldNote();
             stopDrone();
+            stopTremolo();
+            celticOctaveUp = false;
+            lastCelticOctaveUp = false;
+            gestureHistory.reset();
+            lockGestureUntil = 0;
             applyWorldShape(world);
             if (particles) updatePaletteDesc(world.palette);
             applyWorldUI(world);
@@ -1243,20 +1402,214 @@
         }
 
         // ---- Pointer performance: X -> pitch (quantised to the current
-        // world's scale), Y -> brightness/timbre, hold -> play, drag speed ->
-        // performance energy. ----
+        // world's scale), Y -> world-specific technique, hold -> play, drag
+        // speed -> performance energy. ----
         let pointerHeld = false;
         let pointerX = 0.5, pointerY = 0.5;
         let pointerVelocity = 0;
-        let lastPointerX = 0.5, lastPointerT = 0;
-        let lastPointerDir = 0;
         let energyKnob = 0.4;
         let activeSustainVoice = null;
         let droneVoices = [];
         let scratchSpin = 0;
-        let lastScratchTime = 0;
-        const SCRATCH_VELOCITY_THRESHOLD = 1.6;
         let reverbWheelAmount = 0.3;
+
+        // ---- Shared gesture interpreter (sections 3/27/28): mouse, touch
+        // and hand all reduce to the same {x, y, active} shape and flow
+        // through updatePerformanceInput() below, so every world-specific
+        // technique — glissando, strike, roll, breath ornament, bend — is
+        // driven by one history buffer and one set of detectors regardless
+        // of input source. Raw (unsmoothed) samples feed gesture detection;
+        // smoothing is applied separately, only to hand tracking jitter. ----
+        const gestureHistory = createGestureHistory();
+        const techniqueCooldowns = createCooldownTracker();
+        let lastGestureSample = null;
+        let lockGestureUntil = 0;
+        let performanceActive = false;
+
+        const TECHNIQUE_COOLDOWN_MS = { chinese: 400, japanese: 250, celtic: 300, egyptian: 600, blues: 300 };
+        const TECHNIQUE_LABELS = { glissando: 'GLISSANDO', strike: 'STRIKE', roll: 'ROLL', breath: 'BREATH', bend: 'BEND' };
+        const TECHNIQUE_HINTS = {
+            chinese: ['Swipe', 'Gliss'], japanese: ['Down', 'Strike'], celtic: ['Shake', 'Roll'],
+            egyptian: ['Circle', 'Breath'], blues: ['Reverse', 'Bend'],
+        };
+        const TECHNIQUE_METER_LABELS = {
+            chinese: ['PLUCK', 'GLISS'], japanese: ['OPEN', 'DAMPED'], celtic: ['PURE', 'ORNAMENT'],
+            egyptian: ['TONE', 'AIR'], blues: ['CLEAN', 'BEND'],
+        };
+
+        let tremoloActive = false;
+        let tremoloTimeoutId = null;
+        let celticOctaveUp = false;
+        let lastCelticOctaveUp = false;
+
+        function detectSignatureGesture(world, samples) {
+            switch (world.key) {
+                case 'chinese': {
+                    const r = detectHorizontalSwipe(samples, { minDistance: 0.16, minVelocity: 1.8 });
+                    return r.detected ? { type: 'glissando', direction: r.direction, intensity: r.intensity } : null;
+                }
+                case 'japanese': {
+                    const r = detectDownwardStrike(samples, { minDistance: 0.1, minVelocity: 1.6 });
+                    return r.detected ? { type: 'strike', intensity: r.intensity } : null;
+                }
+                case 'celtic': {
+                    const r = detectRapidShake(samples);
+                    return r.detected ? { type: 'roll', intensity: r.intensity } : null;
+                }
+                case 'egyptian': {
+                    const r = detectCircularMotion(samples);
+                    return r.detected ? { type: 'breath', intensity: r.intensity } : null;
+                }
+                case 'blues': {
+                    const r = detectFastReversal(samples);
+                    return r.detected ? { type: 'bend', direction: r.direction, intensity: 0.6 } : null;
+                }
+                default:
+                    return null;
+            }
+        }
+
+        function fireSignatureTechnique(world, gesture, y) {
+            switch (gesture.type) {
+                case 'glissando': triggerGlissando(world, gesture.direction, gesture.intensity); break;
+                case 'strike': triggerKotoStrike(world, gesture.intensity, y); break;
+                case 'roll': triggerCelticRoll(world); break;
+                case 'breath': triggerNeyBreathOrnament(world, gesture.intensity); break;
+                case 'bend': triggerBluesBend(world, gesture.direction, gesture.intensity); break;
+            }
+            showTechniqueFlash(TECHNIQUE_LABELS[gesture.type]);
+            setHandTechniqueState(TECHNIQUE_LABELS[gesture.type]);
+        }
+
+        // ---- Chinese glissando (section 8): a rapid run through the Gong
+        // scale, using only scale notes and only the notes on the swept
+        // side, so it reads as a sweep across strings rather than a slide. --
+        function triggerGlissando(world, direction, intensity) {
+            const startZone = currentResolver().currentZoneIndex();
+            if (startZone == null || !AudioEngine.started) return;
+            const span = world.intervals.length * world.octaveSpan;
+            const steps = 5 + Math.round(intensity * 3);
+            const stepMs = Math.max(24, 42 - intensity * 14);
+            for (let i = 1; i <= steps; i++) {
+                const zone = THREE.MathUtils.clamp(startZone + direction * i, 0, span - 1);
+                setTimeout(() => {
+                    if (currentWorld().key !== 'chinese') return;
+                    const midi = midiForZoneIndex(zone, world.intervals, world.baseMidi);
+                    createInstrumentVoice(midiToFreq(midi), 0.45 + intensity * 0.35, 0.5, world);
+                    onNoteAttack(midi, world);
+                    scratchSpin = direction * 0.12;
+                }, i * stepMs);
+            }
+        }
+
+        // ---- Chinese stillness tremolo (section 9): only while actively
+        // held, only after a short stillness threshold, stopped immediately
+        // on movement/release/world change. ----
+        function scheduleTremoloPluck(world) {
+            if (!tremoloActive || currentWorld().key !== 'chinese') { tremoloActive = false; return; }
+            const zone = currentResolver().currentZoneIndex();
+            if (zone != null && AudioEngine.started) {
+                const midi = midiForZoneIndex(zone, world.intervals, world.baseMidi);
+                createInstrumentVoice(midiToFreq(midi), 0.2 + Math.random() * 0.12, 0.5, world);
+            }
+            tremoloTimeoutId = setTimeout(() => scheduleTremoloPluck(world), 210 + Math.random() * 90);
+        }
+        function startTremolo(world) {
+            if (tremoloActive) return;
+            tremoloActive = true;
+            scheduleTremoloPluck(world);
+        }
+        function stopTremolo() {
+            tremoloActive = false;
+            if (tremoloTimeoutId) { clearTimeout(tremoloTimeoutId); tremoloTimeoutId = null; }
+        }
+
+        // ---- Japanese downward strike (section 11): a sharp, short, damped
+        // articulation — distinct from the Chinese glissando and from the
+        // Koto's normal restrained pluck. ----
+        function triggerKotoStrike(world, intensity, y) {
+            if (!AudioEngine.started) return;
+            const zone = currentResolver().currentZoneIndex();
+            if (zone == null) return;
+            const midi = midiForZoneIndex(zone, world.intervals, world.baseMidi);
+            const dampedWorld = { ...world, synth: { ...world.synth, decay: world.synth.decay * 0.4, release: world.synth.release * 0.5 } };
+            createInstrumentVoice(midiToFreq(midi), 0.55 + intensity * 0.45, y, dampedWorld);
+            onNoteAttack(midi, world);
+            scratchSpin = -0.18 - intensity * 0.1;
+        }
+
+        // ---- Celtic roll/grace ornament (section 13): a brief scale-based
+        // grace note either side of the held target, restrained enough that
+        // the sustained whistle note stays dominant. ----
+        function triggerCelticRoll(world) {
+            if (!activeSustainVoice) return;
+            const zone = currentResolver().currentZoneIndex();
+            if (zone == null) return;
+            const span = world.intervals.length * world.octaveSpan;
+            const graceZone = THREE.MathUtils.clamp(zone + (Math.random() < 0.5 ? 1 : -1), 0, span - 1);
+            const targetMidi = midiForZoneIndex(zone, world.intervals, world.baseMidi);
+            const graceMidi = midiForZoneIndex(graceZone, world.intervals, world.baseMidi);
+            const graceVoice = createInstrumentVoice(midiToFreq(graceMidi), 0.32, 0.5, world);
+            setTimeout(() => graceVoice.release(0.05), 55);
+            setTimeout(() => {
+                if (currentWorld().key !== 'celtic') return;
+                const backVoice = createInstrumentVoice(midiToFreq(targetMidi), 0.28, 0.5, world);
+                setTimeout(() => backVoice.release(0.06), 55);
+            }, 70);
+        }
+
+        // ---- Egyptian breath ornament (section 16): an irregular vibrato
+        // wobble around the currently-held note, applied to the live
+        // sustain voice — never enough to lose the pitch. ----
+        function triggerNeyBreathOrnament(world, intensity) {
+            if (activeSustainVoice) activeSustainVoice.applyOrnament(14 + intensity * 12, 450);
+            scratchSpin = 0.05;
+        }
+
+        // ---- Blues bend/growl (section 19): a temporary detune + reed
+        // saturation kick on the live sustain voice, settling back onto the
+        // exact discrete note — never a permanent detune. ----
+        function triggerBluesBend(world, direction, intensity) {
+            if (activeSustainVoice) activeSustainVoice.applyBend(0.8 + intensity * 1.2, 220 + intensity * 120);
+            scratchSpin = direction * 0.2;
+        }
+
+        let techniqueFlashTimeout = null;
+        function showTechniqueFlash(label) {
+            const el = document.getElementById('technique-flash');
+            if (!el) return;
+            el.textContent = label;
+            el.style.opacity = '1';
+            clearTimeout(techniqueFlashTimeout);
+            techniqueFlashTimeout = setTimeout(() => { el.style.opacity = '0'; }, 650);
+        }
+
+        function updateTechniqueMeter(world, y, sample) {
+            const labels = TECHNIQUE_METER_LABELS[world.key] || ['', ''];
+            const labelA = document.getElementById('technique-meter-label-a');
+            const labelB = document.getElementById('technique-meter-label-b');
+            if (labelA) labelA.textContent = labels[0];
+            if (labelB) labelB.textContent = labels[1];
+            const velocityAmt = THREE.MathUtils.clamp(sample.velocity / 3, 0, 1);
+            const yAmt = THREE.MathUtils.clamp(1 - y, 0, 1);
+            const amt = THREE.MathUtils.clamp(yAmt * 0.6 + velocityAmt * 0.4, 0, 1);
+            const fill = document.getElementById('technique-meter-fill');
+            if (fill) fill.style.width = (amt * 100) + '%';
+        }
+
+        // ---- Y-axis continuous technique (section 6, 18): worlds whose
+        // signature expression isn't already covered by the shared
+        // brightness mapping inside createInstrumentVoice. ----
+        function maybeApplyContinuousYTechnique(world, y) {
+            if (world.key === 'blues' && activeSustainVoice) {
+                const bendAmt = THREE.MathUtils.clamp((0.5 - y) / 0.5, 0, 1);
+                activeSustainVoice.setBendAmount(bendAmt);
+            }
+            if (world.key === 'celtic') {
+                if (!celticOctaveUp && y < 0.08) celticOctaveUp = true;
+                else if (celticOctaveUp && y > 0.16) celticOctaveUp = false;
+            }
+        }
 
         function effectiveEnergy() {
             const velBoost = THREE.MathUtils.clamp(pointerVelocity / 2.5, 0, 1);
@@ -1277,14 +1630,30 @@
         // ---- Ambient tonic+fifth drone, only for worlds that opt in
         // (e.g. Tin Whistle). Lazily started on first note, stopped on
         // world switch. ----
+        let dronePulseTimeoutId = null;
         function stopDrone() {
             droneVoices.forEach((v) => v.release(1.4));
             droneVoices = [];
+            if (dronePulseTimeoutId) { clearTimeout(dronePulseTimeoutId); dronePulseTimeoutId = null; }
         }
         function startDroneIfNeeded(world) {
-            if (!world.drone || droneVoices.length || !AudioEngine.started) return;
-            const tonicMidi = world.baseMidi + world.intervals[0];
-            droneVoices = [createAmbientDrone(midiToFreq(tonicMidi)), createAmbientDrone(midiToFreq(tonicMidi + 7))];
+            if (world.drone && !droneVoices.length && AudioEngine.started) {
+                const tonicMidi = world.baseMidi + world.intervals[0];
+                droneVoices = [createAmbientDrone(midiToFreq(tonicMidi)), createAmbientDrone(midiToFreq(tonicMidi + 7))];
+            }
+            // Egyptian: an extremely subtle tonic-based *pulse* rather than a
+            // sustained pad — a single quiet tonic note, re-plucked slowly
+            // and irregularly, that fades out once the ornament/inactivity
+            // timeout below stops rescheduling it.
+            if (world.dronePulse && !dronePulseTimeoutId && AudioEngine.started) {
+                const scheduleNext = () => {
+                    if (currentWorld().key !== world.key || !activeSustainVoice) { dronePulseTimeoutId = null; return; }
+                    const tonicMidi = world.baseMidi + world.intervals[0];
+                    createInstrumentVoice(midiToFreq(tonicMidi), 0.07, 0.6, { ...world, synthType: 'pluck', synth: { ...world.synth, sustain: 0, decay: 1.4, release: 1.6 } });
+                    dronePulseTimeoutId = setTimeout(scheduleNext, 2600 + Math.random() * 1400);
+                };
+                dronePulseTimeoutId = setTimeout(scheduleNext, 900);
+            }
         }
 
         function playPluckAt(x, y) {
@@ -1310,16 +1679,34 @@
         function startSustainNote(world, x, y) {
             currentResolver().reset();
             const { midi } = currentResolver().resolve(x, performance.now());
-            spawnSustainVoice(world, midi, y);
+            let finalMidi = midi;
+            if (world.key === 'celtic') {
+                // A fresh press reflects the current hand/pointer height
+                // directly; hysteresis (section 12) only governs octave
+                // changes made *while* the note is already held.
+                celticOctaveUp = y < 0.08;
+                lastCelticOctaveUp = celticOctaveUp;
+                if (celticOctaveUp) finalMidi += 12;
+            }
+            spawnSustainVoice(world, finalMidi, y);
             startDroneIfNeeded(world);
-            onNoteAttack(midi, world);
+            onNoteAttack(finalMidi, world);
         }
         function glideSustainNote(world, x, y) {
             if (!activeSustainVoice) return;
             const { midi, changed } = currentResolver().resolve(x, performance.now());
-            if (changed) {
-                spawnSustainVoice(world, midi, y);
-                onNoteAttack(midi, world);
+            let finalMidi = midi;
+            let retrigger = changed;
+            if (world.key === 'celtic') {
+                if (celticOctaveUp) finalMidi += 12;
+                if (celticOctaveUp !== lastCelticOctaveUp) {
+                    retrigger = true;
+                    lastCelticOctaveUp = celticOctaveUp;
+                }
+            }
+            if (retrigger) {
+                spawnSustainVoice(world, finalMidi, y);
+                onNoteAttack(finalMidi, world);
             } else {
                 activeSustainVoice.setBrightness(y);
             }
@@ -1334,83 +1721,53 @@
         function releaseHeldNote() {
             currentResolver().reset();
             stopSustainNote();
+            stopTremolo();
         }
 
-        function handlePointerDown(x, y) {
-            ensureAudioStarted();
-            pointerHeld = true;
+        // ---- Shared performance input (sections 27/28): mouse, touch and
+        // hand all call this one function with a normalised {x, y, active}
+        // shape, so there is exactly one musical engine and one gesture
+        // interpreter behind both input paths — never two parallel ones. ----
+        function updatePerformanceInput({ x, y, active, timestamp }) {
+            const sample = computeSample(lastGestureSample, x, y, timestamp);
+            lastGestureSample = sample;
+            gestureHistory.push(sample);
+            pointerVelocity = sample.velocity;
+
+            const prevActive = performanceActive;
+            performanceActive = active;
             const world = currentWorld();
-            if (world.synthType === 'sustain') startSustainNote(world, x, y);
-            else playPluckAt(x, y);
-        }
-        function handlePointerMove(x, y) {
-            if (!pointerHeld) return;
-            const world = currentWorld();
-            if (world.synthType === 'sustain') glideSustainNote(world, x, y);
-            else playPluckAt(x, y);
-        }
-        function handlePointerUp() {
-            pointerHeld = false;
-            releaseHeldNote();
-        }
 
-        // ---- Scratch gesture: a fast left-right reversal — mouse or hand,
-        // identical trigger and identical musical result either way — fires
-        // a short pitch-bend/filter-sweep/delay burst plus a rotation kick,
-        // instead of a literal vinyl sample. ----
-        function maybeTriggerScratch(dir, velocity) {
-            const now = performance.now();
-            if (now - lastScratchTime < 220) return;
-            lastScratchTime = now;
-            const intensity = THREE.MathUtils.clamp((velocity - SCRATCH_VELOCITY_THRESHOLD) / 3, 0, 1);
-            scratchBurst(dir, intensity);
-        }
+            if (active && !prevActive) {
+                ensureAudioStarted();
+                gestureHistory.reset();
+                gestureHistory.push(sample);
+                lockGestureUntil = 0;
+                if (world.synthType === 'sustain') startSustainNote(world, x, y);
+                else playPluckAt(x, y);
+            } else if (active && prevActive) {
+                if (world.synthType === 'sustain') glideSustainNote(world, x, y);
+                else playPluckAt(x, y);
+            } else if (!active && prevActive) {
+                releaseHeldNote();
+            }
 
-        function scratchBurst(dir, intensity) {
-            ensureAudioStarted();
-            const ctx = AudioEngine.ctx;
-            const now = ctx.currentTime;
-
-            const noise = ctx.createBufferSource();
-            noise.buffer = makeNoiseBuffer(ctx, 0.24);
-
-            const filter = ctx.createBiquadFilter();
-            filter.type = 'bandpass';
-            filter.Q.value = 6;
-            const startFreq = dir > 0 ? 280 : 3200;
-            const endFreq = dir > 0 ? 3200 : 280;
-            filter.frequency.setValueAtTime(startFreq, now);
-            filter.frequency.exponentialRampToValueAtTime(endFreq, now + 0.16);
-
-            const shaper = ctx.createWaveShaper();
-            shaper.curve = makeSaturationCurve(0.55 + intensity * 0.4);
-
-            const burstGain = ctx.createGain();
-            burstGain.gain.setValueAtTime(0.0001, now);
-            burstGain.gain.linearRampToValueAtTime(0.22 + intensity * 0.25, now + 0.015);
-            burstGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
-
-            noise.connect(filter);
-            filter.connect(shaper);
-            shaper.connect(burstGain);
-            burstGain.connect(AudioEngine.compressor);
-
-            const delayBoost = ctx.createGain();
-            delayBoost.gain.value = 0.6;
-            burstGain.connect(delayBoost);
-            delayBoost.connect(AudioEngine.delaySend);
-            const prevDelaySend = AudioEngine.delaySend.gain.value;
-            AudioEngine.delaySend.gain.setTargetAtTime(0.4, now, 0.015);
-            AudioEngine.delaySend.gain.setTargetAtTime(prevDelaySend, now + 0.28, 0.18);
-
-            noise.start(now);
-            noise.stop(now + 0.24);
-            setTimeout(() => {
-                try { filter.disconnect(); shaper.disconnect(); burstGain.disconnect(); delayBoost.disconnect(); } catch (e) {}
-            }, 500);
-
-            scratchSpin = dir * (0.15 + intensity * 0.3);
-            noteAttackPulse = Math.max(noteAttackPulse, 0.6);
+            if (active) {
+                maybeApplyContinuousYTechnique(world, y);
+                const samples = gestureHistory.get();
+                if (timestamp >= lockGestureUntil) {
+                    const gesture = detectSignatureGesture(world, samples);
+                    if (gesture && techniqueCooldowns.ready(world.key, timestamp, TECHNIQUE_COOLDOWN_MS[world.key])) {
+                        techniqueCooldowns.fire(world.key, timestamp);
+                        lockGestureUntil = timestamp + 90;
+                        fireSignatureTechnique(world, gesture, y);
+                    } else if (world.key === 'chinese') {
+                        const still = detectStillHold(samples, { minDurationMs: 420 });
+                        if (still.still) startTremolo(world); else stopTremolo();
+                    }
+                }
+                updateTechniqueMeter(world, y, sample);
+            }
         }
 
         let ringLayerMeshes = [];
@@ -1456,90 +1813,113 @@
             });
         }
 
+        let handOnline = false;
+        let handTechniqueRevertTimeout = null;
+
+        // ---- Hand status (section 30): small, wording-only state machine —
+        // the webcam preview box itself is untouched, only its label text/
+        // colour changes between offline / ready / pinch-prompt / playing /
+        // an active signature-technique name. ----
         function setHandOnline(online) {
+            handOnline = online;
             const status = document.getElementById('hand-status');
             const badge = document.getElementById('hand-badge');
             if (online) {
-                status.innerHTML = '<span class="status-dot bg-emerald-400"></span>Hand Engine Online';
+                status.innerHTML = '<span class="status-dot bg-emerald-400"></span>Hand Ready';
                 status.className = 'text-[8px] text-center font-mono mb-2 uppercase tracking-widest text-emerald-400';
                 badge.textContent = 'Hand Control Online';
                 badge.className = 'text-emerald-400';
             } else {
-                status.innerHTML = '<span class="status-dot bg-red-500"></span>Hand Engine Offline';
+                status.innerHTML = '<span class="status-dot bg-red-500"></span>Hand Offline';
                 status.className = 'text-[8px] text-center font-mono mb-2 uppercase tracking-widest text-red-500';
                 badge.textContent = 'Hand Control Offline';
                 badge.className = 'text-red-400';
             }
         }
 
-        // ---- Hand performance: the same X->pitch / Y->timbre / hold->play
-        // mapping as the mouse, so the webcam is a genuine alternative
-        // instrument, not a decoration. X is mirrored to match the mirrored
-        // preview (move your hand right -> pitch goes up, as seen on screen).
-        let handPinched = false;
-        let lastHandX = 0.5, lastHandT = 0, lastHandDir = 0;
+        function setHandTechniqueState(label) {
+            if (!handOnline) return;
+            const status = document.getElementById('hand-status');
+            if (!status) return;
+            status.innerHTML = `<span class="status-dot bg-emerald-400"></span>${label}`;
+            clearTimeout(handTechniqueRevertTimeout);
+            if (label !== 'PINCH TO PLAY' && label !== 'PLAYING') {
+                handTechniqueRevertTimeout = setTimeout(() => {
+                    if (handOnline) setHandTechniqueState(handPinchTracker.isActive ? 'PLAYING' : 'PINCH TO PLAY');
+                }, 650);
+            }
+        }
+
+        // ---- Hand performance: the same X->pitch / Y->technique / hold->play
+        // mapping as the mouse, funnelled through the one shared
+        // updatePerformanceInput() pipeline — the webcam is a genuine
+        // alternative instrument, not a second, parallel engine. X is
+        // mirrored to match the mirrored preview (move your hand right ->
+        // pitch goes up, as seen on screen). ----
+        const handPinchTracker = createPinchTracker(0.045, 0.065);
+        const handXSmoother = createEmaSmoother(0.5);
+        const handYSmoother = createEmaSmoother(0.5);
+        const handOpennessSmoother = createEmaSmoother(0.25);
+        const HAND_LOST_GRACE_MS = 220;
+        let handLostTimeoutId = null;
 
         function handleHands(res) {
             if (res.multiHandLandmarks && res.multiHandLandmarks.length > 0) {
-                setHandOnline(true);
+                if (handLostTimeoutId) { clearTimeout(handLostTimeoutId); handLostTimeoutId = null; }
+                if (!handOnline) setHandOnline(true);
                 const lm = res.multiHandLandmarks[0];
 
-                const handX = THREE.MathUtils.clamp(1 - lm[8].x, 0, 1);
-                const handY = THREE.MathUtils.clamp(lm[8].y, 0, 1);
+                const rawX = THREE.MathUtils.clamp(1 - lm[8].x, 0, 1);
+                const rawY = THREE.MathUtils.clamp(lm[8].y, 0, 1);
+                // Light EMA smoothing only, so genuine fast gestures (swipe,
+                // strike, shake) aren't blunted — the discrete-note
+                // hysteresis in scale.ts already absorbs any residual jitter
+                // at zone boundaries.
+                const handX = handXSmoother.update(rawX);
+                const handY = handYSmoother.update(rawY);
 
                 targetRotY = (handX - 0.5) * 0.02;
                 targetRotX = (handY - 0.5) * 0.01;
 
-                // Same scratch trigger as the mouse: a fast horizontal
-                // direction reversal, so the gesture isn't hand-only.
-                const handNow = performance.now();
-                const handDt = Math.max(1, handNow - lastHandT);
-                const handDx = handX - lastHandX;
-                const handVelocity = Math.abs(handDx) / (handDt / 1000);
-                const handDir = handDx > 0.004 ? 1 : (handDx < -0.004 ? -1 : 0);
-                if (handDir !== 0 && lastHandDir !== 0 && handDir !== lastHandDir && handVelocity > SCRATCH_VELOCITY_THRESHOLD) {
-                    maybeTriggerScratch(handDir, handVelocity);
-                }
-                if (handDir !== 0) lastHandDir = handDir;
-                lastHandX = handX; lastHandT = handNow;
+                // Continuous hand openness (section 22/23): four
+                // fingertip-to-wrist spreads, smoothed, in place of the old
+                // binary open/closed check. Open -> more space/reverb/
+                // dispersion; closed fist -> tighter/drier, same slider the
+                // mouse's ENERGY control drives.
+                const openness = handOpennessSmoother.update(computeHandOpenness([
+                    Math.hypot(lm[8].x - lm[0].x, lm[8].y - lm[0].y),
+                    Math.hypot(lm[12].x - lm[0].x, lm[12].y - lm[0].y),
+                    Math.hypot(lm[16].x - lm[0].x, lm[16].y - lm[0].y),
+                    Math.hypot(lm[20].x - lm[0].x, lm[20].y - lm[0].y),
+                ]));
+                applySpaceAmount(openness);
 
-                // Openness: average fingertip-to-wrist spread across the four
-                // fingers. Open hand -> more space/reverb/dispersion; closed
-                // fist -> particles and sound pull back in tight.
-                const spread = (
-                    Math.hypot(lm[8].x - lm[0].x, lm[8].y - lm[0].y) +
-                    Math.hypot(lm[12].x - lm[0].x, lm[12].y - lm[0].y) +
-                    Math.hypot(lm[16].x - lm[0].x, lm[16].y - lm[0].y) +
-                    Math.hypot(lm[20].x - lm[0].x, lm[20].y - lm[0].y)
-                ) / 4;
-                const openness = THREE.MathUtils.clamp((spread - 0.15) / (0.35 - 0.15), 0, 1);
-                targetDispersion = openness * 0.55;
-                if (AudioEngine.started) AudioEngine.setReverbAmount(0.12 + openness * 0.4);
-
-                // Pinch (thumb tip 4, index tip 8) -> note on, sustained
-                // while pinched, released when the fingers separate.
+                // Pinch (thumb tip 4, index tip 8) -> note on/off, gated by
+                // two-threshold hysteresis so it can't flicker on tracking
+                // jitter sitting between "just pinched" and "just released".
                 const pinchDist = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
-                const pinched = pinchDist < 0.06;
-                const world = currentWorld();
+                const pinched = handPinchTracker.update(pinchDist);
 
-                if (pinched && !handPinched) {
-                    ensureAudioStarted();
-                    handPinched = true;
-                    if (world.synthType === 'sustain') startSustainNote(world, handX, handY);
-                    else playPluckAt(handX, handY);
-                } else if (pinched && handPinched) {
-                    if (world.synthType === 'sustain') glideSustainNote(world, handX, handY);
-                    else playPluckAt(handX, handY);
-                } else if (!pinched && handPinched) {
-                    handPinched = false;
-                    releaseHeldNote();
-                }
-            } else {
-                setHandOnline(false);
-                targetRotX = autoRotX;
-                targetRotY = autoRotY;
-                targetDispersion *= 0.96;
-                if (handPinched) { handPinched = false; releaseHeldNote(); }
+                updatePerformanceInput({ source: 'hand', x: handX, y: handY, active: pinched, timestamp: performance.now() });
+                if (handOnline) setHandTechniqueState(pinched ? 'PLAYING' : 'PINCH TO PLAY');
+            } else if (!handLostTimeoutId) {
+                // Grace period: a single dropped frame of tracking noise
+                // must not yank the note or reset state — only a sustained
+                // loss does.
+                handLostTimeoutId = setTimeout(() => {
+                    handLostTimeoutId = null;
+                    setHandOnline(false);
+                    targetRotX = autoRotX;
+                    targetRotY = autoRotY;
+                    targetDispersion *= 0.96;
+                    if (handPinchTracker.isActive) {
+                        updatePerformanceInput({ source: 'hand', x: pointerX, y: pointerY, active: false, timestamp: performance.now() });
+                    }
+                    handPinchTracker.reset();
+                    handXSmoother.reset();
+                    handYSmoother.reset();
+                    handOpennessSmoother.reset();
+                }, HAND_LOST_GRACE_MS);
             }
         }
 

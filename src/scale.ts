@@ -94,6 +94,13 @@ export function createNoteResolver(opts: NoteResolverOptions) {
       lastChangeTime = -Infinity;
     },
 
+    /** The last resolved zone index, or null before the first resolve() —
+     * lets a signature-gesture trigger (e.g. glissando) start from "the note
+     * currently sounding" without re-deriving it from a stale pointer X. */
+    currentZoneIndex(): number | null {
+      return lastZoneIndex;
+    },
+
     resolve(x01: number, now: number): NoteResolution {
       const raw = clamp01(x01) * span;
       const candidate = Math.min(span - 1, Math.floor(raw));
