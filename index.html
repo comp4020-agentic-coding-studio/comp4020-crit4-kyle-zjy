@@ -967,7 +967,7 @@
 
             const ampGain = ctx.createGain();
             ampGain.gain.setValueAtTime(0.0001, now);
-            const peakVolume = 0.3 + velocity * 0.7;
+            const peakVolume = (0.3 + velocity * 0.7) * (world.volume ?? 1);
             ampGain.gain.linearRampToValueAtTime(peakVolume, now + attackTime);
             ampGain.gain.linearRampToValueAtTime(peakVolume * s.sustain, now + attackTime + s.decay);
             filter.connect(ampGain);
@@ -1297,7 +1297,7 @@
                 key: 'chinese', name: 'Chinese · Gong', scaleName: 'Gong Pentatonic',
                 instrumentName: 'Guzheng', notesLabel: 'C · D · E · G · A',
                 intervals: SCALES.chineseGong, synthType: 'pluck',
-                baseMidi: 48, octaveSpan: 4,
+                baseMidi: 48, octaveSpan: 4, volume: 0.85,
                 synth: { type: 'sawtooth', attack: 0.01, decay: 2.0, sustain: 0.0, release: 2.5, filterBase: 800, filterEnv: 6000, res: 2, detune: 2 },
                 effects: { reverb: 0.5, delay: 0.3, distortion: 0 },
                 palette: { hue: 0.02, hueSpread: 0.05, satRange: [0.6, 0.9], lightRange: [0.45, 0.65], accentHue: 0.12, accentChance: 0.25 },
@@ -1307,7 +1307,7 @@
                 key: 'japanese', name: 'Japanese · In Sen', scaleName: 'In Sen',
                 instrumentName: 'Koto', notesLabel: 'C · D♭ · F · G · B♭',
                 intervals: SCALES.japaneseInSen, synthType: 'pluck',
-                baseMidi: 48, octaveSpan: 4,
+                baseMidi: 48, octaveSpan: 4, volume: 0.80,
                 synth: { type: 'square', attack: 0.005, decay: 0.5, sustain: 0.0, release: 0.8, filterBase: 1000, filterEnv: 8000, res: 5, detune: 0 },
                 effects: { reverb: 0.7, delay: 0.2, distortion: 0 },
                 palette: { hue: 0.97, hueSpread: 0.04, satRange: [0.1, 0.35], lightRange: [0.55, 0.85], accentHue: 0.98, accentChance: 0.15 },
@@ -1318,7 +1318,7 @@
                 instrumentName: 'Tin Whistle', notesLabel: 'C · D · E♭ · F · G · A · B♭',
                 intervals: SCALES.celticDorian, synthType: 'sustain',
                 baseMidi: 60, octaveSpan: 3,
-                crossfadeMs: 60, drone: true,
+                crossfadeMs: 60, drone: true, volume: 0.70,
                 synth: { type: 'triangle', attack: 0.1, decay: 0.3, sustain: 0.8, release: 0.4, filterBase: 1500, filterEnv: 3000, res: 1, detune: 5 },
                 effects: { reverb: 0.6, delay: 0.4, distortion: 0 },
                 palette: { hue: 0.42, hueSpread: 0.08, satRange: [0.35, 0.7], lightRange: [0.45, 0.75], accentHue: 0.5, accentChance: 0.3 },
@@ -1329,8 +1329,8 @@
                 instrumentName: 'Ney', notesLabel: 'C · D · F · G · B♭',
                 intervals: SCALES.egyptianPentatonic, synthType: 'sustain',
                 baseMidi: 60, octaveSpan: 3,
-                crossfadeMs: 90, dronePulse: true,
-                synth: { type: 'sine', attack: 0.15, decay: 0.4, sustain: 0.7, release: 0.6, filterBase: 800, filterEnv: 2000, res: 3, detune: 8 },
+                crossfadeMs: 90, dronePulse: true, volume: 0.50,
+                synth: { type: 'sine', attack: 0.15, decay: 0.4, sustain: 0.45, release: 0.6, filterBase: 800, filterEnv: 2000, res: 3, detune: 8 },
                 effects: { reverb: 0.4, delay: 0.2, distortion: 0.05 },
                 palette: { hue: 0.09, hueSpread: 0.05, satRange: [0.4, 0.75], lightRange: [0.4, 0.65], accentHue: 0.6, accentChance: 0.12 },
                 shapeKey: 'ney'
@@ -1340,9 +1340,9 @@
                 instrumentName: 'Blues Harmonica', notesLabel: 'C · E♭ · F · G♭ · G · B♭',
                 intervals: SCALES.bluesMinor, synthType: 'sustain',
                 baseMidi: 60, octaveSpan: 3,
-                crossfadeMs: 15,
-                synth: { type: 'square', attack: 0.08, decay: 0.2, sustain: 0.9, release: 0.3, filterBase: 2000, filterEnv: 5000, res: 8, detune: 10 },
-                effects: { reverb: 0.3, delay: 0.1, distortion: 0.6 },
+                crossfadeMs: 15, volume: 0.42,
+                synth: { type: 'square', attack: 0.08, decay: 0.2, sustain: 0.50, release: 0.3, filterBase: 2000, filterEnv: 5000, res: 8, detune: 10 },
+                effects: { reverb: 0.3, delay: 0.1, distortion: 0.12 },
                 palette: { hue: 0.62, hueSpread: 0.07, satRange: [0.55, 0.85], lightRange: [0.4, 0.65], accentHue: 0.1, accentChance: 0.15 },
                 shapeKey: 'harmonica'
             }
